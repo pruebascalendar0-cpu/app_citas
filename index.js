@@ -43,7 +43,7 @@ app.listen(PUERTO,()=>{
 /*Correos*/
 function enviarCorreo(destinatario, fecha, hora) {
   const mailOptions = {
-    from: `Clínica Salud Total <${process.env.EMAIL_USER}>`,
+    from: `Clínica Salud Total <josventura06@gmail.com>`,
     to: destinatario,
     subject: "Confirmación de tu cita médica",
     html: `
@@ -70,7 +70,7 @@ function enviarCorreo(destinatario, fecha, hora) {
 
 function enviarCorreoBienvenida(destinatario, nombre) {
   const mailOptions = {
-    from: `Clínica Salud Total <${process.env.EMAIL_USER}>`,
+    from: `Clínica Salud Total <josventura06@gmail.com>`,
     to: destinatario,
     subject: "Bienvenido a Clínica Salud Total",
     html: `
@@ -97,7 +97,7 @@ function enviarCorreoBienvenida(destinatario, nombre) {
 
 function enviarCorreoRecuperacion(destinatario, nombre, contrasena) {
   const mailOptions = {
-    from: `Clínica Salud Total <${process.env.EMAIL_USER}>`,
+    from: `Clínica Salud Total <josventura06@gmail.com>`,
     to: destinatario,
     subject: "Recuperación de contraseña - Clínica Salud Total",
     html: `
@@ -128,7 +128,7 @@ function enviarCorreoRecuperacion(destinatario, nombre, contrasena) {
 
 function enviarCorreoActualizacion(destinatario, fecha, hora) {
   const mailOptions = {
-    from: `Clínica Salud Total <${process.env.EMAIL_USER}>`,
+    from: `Clínica Salud Total <josventura06@gmail.com>`,
     to: destinatario,
     subject: "Actualización de tu cita médica",
     html: `
@@ -156,7 +156,7 @@ function enviarCorreoActualizacion(destinatario, fecha, hora) {
 
 function enviarCorreoCancelacion(destinatario, fecha, hora) {
   const mailOptions = {
-    from: `Clínica Salud Total <${process.env.EMAIL_USER}>`,
+    from: `Clínica Salud Total <josventura06@gmail.com>`,
     to: destinatario,
     subject: "Cancelación de tu cita médica",
     html: `
