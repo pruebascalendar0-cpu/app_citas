@@ -12,15 +12,11 @@ const PUERTO = process.env.PORT || 3000;
 app.use(bodyParser.json())
 
 const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,          // SSL directo
-  secure: true,       // true para 465
+  service: "gmail",
   auth: {
-    user: process.env.EMAIL_USER,    
-    pass: process.env.EMAIL_PASSWORD,  
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASSWORD,
   },
-  connectionTimeout: 15000,
-  socketTimeout: 20000,
 });
 
 const conexion = mysql.createConnection({
