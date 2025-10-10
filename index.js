@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express")
@@ -18,6 +19,10 @@ const transporter = nodemailer.createTransport({
     pass: process.env.EMAIL_PASSWORD,
   },
 });
+
+function correoFrom(nombre = "Clínica Salud Total") {
+  return `"${nombre}" <${process.env.EMAIL_USER}>`;
+}
 
 const conexion = mysql.createConnection({
   host: process.env.DB_HOST,
@@ -43,7 +48,7 @@ app.listen(PUERTO,()=>{
 /*Correos*/
 function enviarCorreo(destinatario, fecha, hora) {
   const mailOptions = {
-    from: `Clínica Salud Total <josventura06@gmail.com>`,
+    from: correoFrom(),
     to: destinatario,
     subject: "Confirmación de tu cita médica",
     html: `
@@ -70,7 +75,7 @@ function enviarCorreo(destinatario, fecha, hora) {
 
 function enviarCorreoBienvenida(destinatario, nombre) {
   const mailOptions = {
-    from: `Clínica Salud Total <josventura06@gmail.com>`,
+    from: correoFrom(),
     to: destinatario,
     subject: "Bienvenido a Clínica Salud Total",
     html: `
@@ -97,7 +102,7 @@ function enviarCorreoBienvenida(destinatario, nombre) {
 
 function enviarCorreoRecuperacion(destinatario, nombre, contrasena) {
   const mailOptions = {
-    from: `Clínica Salud Total <josventura06@gmail.com>`,
+    from: correoFrom(),
     to: destinatario,
     subject: "Recuperación de contraseña - Clínica Salud Total",
     html: `
@@ -128,7 +133,7 @@ function enviarCorreoRecuperacion(destinatario, nombre, contrasena) {
 
 function enviarCorreoActualizacion(destinatario, fecha, hora) {
   const mailOptions = {
-    from: `Clínica Salud Total <josventura06@gmail.com>`,
+    from: correoFrom(),
     to: destinatario,
     subject: "Actualización de tu cita médica",
     html: `
@@ -156,7 +161,7 @@ function enviarCorreoActualizacion(destinatario, fecha, hora) {
 
 function enviarCorreoCancelacion(destinatario, fecha, hora) {
   const mailOptions = {
-    from: `Clínica Salud Total <josventura06@gmail.com>`,
+    from: correoFrom(),
     to: destinatario,
     subject: "Cancelación de tu cita médica",
     html: `
@@ -182,6 +187,21 @@ function enviarCorreoCancelacion(destinatario, fecha, hora) {
   });
 }
 /*Correos*/
+
+app.get("/test-correo", async (req, res) => {
+  try {
+    const info = await transporter.sendMail({
+      from: correoFrom("Clínica Salud Total (Test)"),
+      to: process.env.EMAIL_USER, // te lo envías a ti
+      subject: "Prueba SMTP",
+      text: "Hola, este es un test de SMTP con Gmail.",
+    });
+    res.json({ ok: true, messageId: info.messageId });
+  } catch (err) {
+    console.error("❌ /test-correo error:", err);
+    res.status(500).json({ ok: false, error: String(err), code: err.code });
+  }
+});
 
 /*Usuarios*/
 app.get("/usuarios",(req,res)=>{
@@ -1138,4 +1158,3 @@ app.put("/especialidad/actualizar/:id", (req, res) => {
     res.json({ mensaje: "Especialidad actualizada correctamente" });
   });
 });
-
