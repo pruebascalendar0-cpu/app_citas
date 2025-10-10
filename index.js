@@ -1,134 +1,256 @@
+// index
 require("dotenv").config();
 
 const express = require("express");
 const mysql = require("mysql2");
+const sg = require("@sendgrid/mail");
 
+// Express / Ap
 const app = express();
 const PUERTO = process.env.PORT || 3000;
-app.use(express.json()); // body-parser no necesario
+app.use(express.json());
 
-const sg = require("@sendgrid/mail");
+// SendGrid
 sg.setApiKey(process.env.SENDGRID_API_KEY);
 
-function fromName() {
-  return process.env.EMAIL_FROM || "Clínica Salud Total <pruebascalendar0@gmail.com>";
+function FROM() {
+  return process.env.EMAIL_FROM || 'Clínica Salud Total <pruebascalendar0@gmail.com>';
 }
 
+function REPLY_TO() {
+  return process.env.REPLY_TO || 'pruebascalendar0@gmail.com';
+}
+
+// Cabeceras 
+function listUnsubHeaders() {
+  const items = [];
+  if (process.env.UNSUB_MAILTO) items.push(`<mailto:${process.env.UNSUB_MAILTO}>`);
+  if (process.env.UNSUB_URL) items.push(`<${process.env.UNSUB_URL}>`);
+  return items.length ? { "List-Unsubscribe": items.join(", ") } : undefined;
+}
+
+/**
+ * Envío centralizado con buenas prácticas anti-spam:
+ * - Texto plano además del HTML
+ * - Reply-To real
+ * - Tracking desactivado (hasta tener Link Branding)
+ * - Categoría para ver en Activity
+ * - Manejo de errores mostrando body de SendGrid si existe
+ */
+async function enviarMail({ to, subject, html, text, category = "notificaciones" }) {
+  const headers = listUnsubHeaders();
+
+  const msg = {
+    from: FROM(),
+    to,
+    subject,
+    html,
+    text:
+      text ||
+      html
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim(),
+    replyTo: REPLY_TO(),
+    trackingSettings: {
+      clickTracking: { enable: false, enableText: false },
+      openTracking: { enable: false },
+      subscriptionTracking: { enable: false },
+    },
+    mailSettings: {
+      // Puedes activar sandbox con SENDGRID_SANDBOX=true para pruebas sin envío real
+      sandboxMode: { enable: process.env.SENDGRID_SANDBOX === "true" },
+    },
+    categories: [category],
+    headers,
+  };
+
+  try {
+    await sg.send(msg);
+  } catch (err) {
+    // Muestra detalle de SendGrid si viene en response.body
+    if (err.response?.body) {
+      console.error("❌ SG Error:", JSON.stringify(err.response.body, null, 2));
+    } else {
+      console.error("❌ SG Error:", err);
+    }
+    throw err;
+  }
+}
+
+// BD
 const conexion = mysql.createConnection({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
   database: process.env.DB_NAME,
   user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD
+  password: process.env.DB_PASSWORD,
 });
 
-conexion.connect(error =>{
-    if(error) throw error
-    console.log("Conexion exitosa a la base de datos")
-})
-
-app.get("/",(req,res)=>{
-    res.send("Bienvenido a mi servicio web")
-})
-
-app.listen(PUERTO,()=>{
-    console.log("Servidor corriendo en el puerto "+ PUERTO)
+conexion.connect((error) => {
+  if (error) throw error;
+  console.log("Conexion exitosa a la base de datos");
 });
 
-/*Correos*/
+// === Rutas básicas ===
+app.get("/", (req, res) => {
+  res.send("Bienvenido a mi servicio web");
+});
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
+});
+
+app.listen(PUERTO, () => {
+  console.log("Servidor corriendo en el puerto " + PUERTO);
+});
+
+// PLANTILLAS DE CORREO
+function tplWrapper(innerHtml) {
+  // HTML limpio, sin estilos agresivos, con pie simple
+  return `
+  <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; line-height:1.5; color:#222; max-width:560px">
+    ${innerHtml}
+    <hr style="border:none;border-top:1px solid #eee;margin:16px 0" />
+    <div style="font-size:12px;color:#777">
+      Clínica Salud Total · Mensaje automático. Si no esperabas este correo, puedes ignorarlo.
+    </div>
+  </div>`;
+}
+
+// Confirmación de cita
 async function enviarCorreo(destinatario, fecha, hora) {
-  await sg.send({
-    from: fromName(),
+  const subject = "Confirmación de tu cita médica";
+  const html = tplWrapper(`
+    <h2 style="margin:0 0 8px 0;">Cita médica confirmada</h2>
+    <p>Tu cita ha sido registrada con éxito.</p>
+    <p><strong>Fecha:</strong> ${fecha}<br/><strong>Hora:</strong> ${hora}</p>
+  `);
+
+  await enviarMail({
     to: destinatario,
-    subject: "Confirmación de tu cita médica",
-    html: `
-      <h2 style="color:#2e86de;">¡Cita médica confirmada!</h2>
-      <p>Tu cita ha sido registrada con éxito.</p>
-      <p><strong>Fecha:</strong> ${fecha}</p>
-      <p><strong>Hora:</strong> ${hora}</p>
-      <hr/><small>Mensaje automático, no responder.</small>
-    `,
+    subject,
+    html,
+    text: `Cita confirmada. Fecha: ${fecha}. Hora: ${hora}.`,
+    category: "citas-confirmacion",
   });
+
   console.log("📧 Confirmación enviada a", destinatario);
 }
 
+// Bienvenida
 async function enviarCorreoBienvenida(destinatario, nombre) {
-  await sg.send({
-    from: fromName(),
+  const subject = "Bienvenido a Clínica Salud Total";
+  const html = tplWrapper(`
+    <h2 style="margin:0 0 8px 0;">¡Bienvenido, ${nombre}!</h2>
+    <p>Tu registro en <strong>Clínica Salud Total</strong> fue exitoso.</p>
+    <p>Ya puedes ingresar y programar tus citas médicas.</p>
+  `);
+
+  await enviarMail({
     to: destinatario,
-    subject: "Bienvenido a Clínica Salud Total",
-    html: `
-      <h2 style="color:#2e86de;">¡Bienvenido, ${nombre}!</h2>
-      <p>Tu registro en <strong>Clínica Salud Total</strong> ha sido exitoso.</p>
-      <p>Ahora puedes ingresar a la aplicación y programar tus citas médicas.</p>
-      <hr/><small>Mensaje automático, no responder.</small>
-    `,
+    subject,
+    html,
+    text: `Bienvenido, ${nombre}. Tu registro en Clínica Salud Total fue exitoso.`,
+    category: "bienvenida",
   });
+
   console.log("📧 Bienvenida enviada a", destinatario);
 }
 
+// Recuperación de contraseña
 async function enviarCorreoRecuperacion(destinatario, nombre, contrasena) {
-  await sg.send({
-    from: fromName(),
+  const subject = "Recuperación de contraseña – Clínica Salud Total";
+  const html = tplWrapper(`
+    <h2 style="margin:0 0 8px 0;">Recuperación de contraseña</h2>
+    <p>Hola <strong>${nombre}</strong>, atendimos tu solicitud de recuperación.</p>
+    <p><strong>Tu contraseña actual:</strong> ${contrasena}</p>
+    <p>Por seguridad, cámbiala después de iniciar sesión.</p>
+  `);
+
+  await enviarMail({
     to: destinatario,
-    subject: "Recuperación de contraseña - Clínica Salud Total",
-    html: `
-      <h2 style="color:#e74c3c;">Recuperación de contraseña</h2>
-      <p>Hola <strong>${nombre}</strong>, has solicitado recuperar tu contraseña.</p>
-      <p><strong>Tu contraseña actual es:</strong> ${contrasena}</p>
-      <p>Te recomendamos cambiarla una vez inicies sesión.</p>
-      <hr/><small>Mensaje automático, no responder.</small>
-    `,
+    subject,
+    html,
+    text: `Recuperación de contraseña. Usuario: ${nombre}. Contraseña actual: ${contrasena}.`,
+    category: "recuperacion",
   });
+
   console.log("📧 Recuperación enviada a", destinatario);
 }
 
+// Actualización de cita
 async function enviarCorreoActualizacion(destinatario, fecha, hora) {
-  await sg.send({
-    from: fromName(),
+  const subject = "Actualización de tu cita médica";
+  const html = tplWrapper(`
+    <h2 style="margin:0 0 8px 0;">Cita actualizada</h2>
+    <p>Hicimos un cambio en tu cita.</p>
+    <p><strong>Nueva fecha:</strong> ${fecha}<br/><strong>Hora:</strong> ${hora}</p>
+  `);
+
+  await enviarMail({
     to: destinatario,
-    subject: "Actualización de tu cita médica",
-    html: `
-      <h2 style="color:#f39c12;">¡Cita médica actualizada!</h2>
-      <p><strong>Nueva Fecha:</strong> ${fecha}</p>
-      <p><strong>Hora:</strong> ${hora}</p>
-      <hr/><small>Mensaje automático, no responder.</small>
-    `,
+    subject,
+    html,
+    text: `Cita actualizada. Nueva fecha: ${fecha}. Hora: ${hora}.`,
+    category: "citas-actualizacion",
   });
+
   console.log("📧 Actualización enviada a", destinatario);
 }
 
+//Cancelación de cita
 async function enviarCorreoCancelacion(destinatario, fecha, hora) {
-  await sg.send({
-    from: fromName(),
+  const subject = "Cancelación de tu cita médica";
+  const html = tplWrapper(`
+    <h2 style="margin:0 0 8px 0;">Cita cancelada</h2>
+    <p>Se canceló tu cita.</p>
+    <p><strong>Fecha:</strong> ${fecha}<br/><strong>Hora:</strong> ${hora}</p>
+    <p>Si fue un error, agenda una nueva cita desde la app.</p>
+  `);
+
+  await enviarMail({
     to: destinatario,
-    subject: "Cancelación de tu cita médica",
-    html: `
-      <h2 style="color:#c0392b;">Cita cancelada</h2>
-      <p><strong>Fecha:</strong> ${fecha}</p>
-      <p><strong>Hora:</strong> ${hora}</p>
-      <p>Si fue un error, agenda una nueva cita.</p>
-      <hr/><small>Mensaje automático, no responder.</small>
-    `,
+    subject,
+    html,
+    text: `Cita cancelada. Fecha: ${fecha}. Hora: ${hora}.`,
+    category: "citas-cancelacion",
   });
+
   console.log("📧 Cancelación enviada a", destinatario);
 }
 
-// Endpoint de prueba:
+// === Endpoint de prueba ===
 app.get("/test-correo", async (req, res) => {
   try {
-    await sg.send({
-      from: fromName(),
-      to: process.env.TEST_TO || (process.env.EMAIL_FROM?.match(/<(.+)>/) || [])[1] || "pruebascalendar0@gmail.com",
+    const to =
+      process.env.TEST_TO ||
+      (process.env.EMAIL_FROM?.match(/<(.+)>/) || [])[1] ||
+      "pruebascalendar0@gmail.com";
+
+    await enviarMail({
+      to,
       subject: "Prueba de envío (SendGrid + Render)",
-      text: "Si ves este correo, todo OK 🎉",
+      html: tplWrapper(`<p>Si ves este correo, todo OK 🎉</p>`),
+      text: "Si ves este correo, todo OK.",
+      category: "test",
     });
-    res.json({ ok: true });
+
+    res.json({ ok: true, to });
   } catch (err) {
-    console.error("❌ Error test-correo:", err);
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
+
+// Exporta funciones
+module.exports = {
+  enviarCorreo,
+  enviarCorreoBienvenida,
+  enviarCorreoRecuperacion,
+  enviarCorreoActualizacion,
+  enviarCorreoCancelacion,
+};
 /*Correos*/
 
 /*Usuarios*/
