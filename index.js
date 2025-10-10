@@ -13,22 +13,18 @@ app.use(bodyParser.json())
 
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
-  port: 587,           // STARTTLS
-  secure: false,       // importante: false en 587
+  port: 465,
+  secure: true,           // SSL directo
   auth: {
     user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD, // App Password SIN espacios
+    pass: process.env.EMAIL_PASSWORD,
   },
-  // Forzar IPv4 y dar más tiempo a la conexión
   family: 4,
-  connectionTimeout: 30000,  // 30s
+  connectionTimeout: 30000,
   socketTimeout: 30000,
-  tls: {
-    minVersion: "TLSv1.2",
-    rejectUnauthorized: true,
-  },
-  logger: true,  // logs detallados al servidor
-  debug: true,   // logs del protocolo
+  tls: { minVersion: "TLSv1.2", rejectUnauthorized: true },
+  logger: true,
+  debug: true,
 });
 
 transporter.verify()
