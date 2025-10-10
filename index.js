@@ -6,16 +6,12 @@ const mysql = require("mysql2");
 const crypto = require("crypto");
 const sg = require("@sendgrid/mail");
 
-// ===============================
-// App / Express
-// ===============================
+// --- App / Express ---
 const app = express();
 const PUERTO = process.env.PORT || 3000;
 app.use(express.json());
 
-// ===============================
-// SendGrid
-// ===============================
+// --- SendGrid ---
 sg.setApiKey(process.env.SENDGRID_API_KEY);
 function FROM() { return process.env.EMAIL_FROM || "Clínica Salud Total <pruebascalendar0@gmail.com>"; }
 function REPLY_TO() { return process.env.REPLY_TO || "pruebascalendar0@gmail.com"; }
@@ -34,11 +30,9 @@ async function enviarMail({ to, subject, html, text, category = "notificaciones"
     html,
     text:
       text ||
-      html
-        .replace(/<style[\s\S]*?<\/style>/gi, " ")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/\s+/g, " ")
-        .trim(),
+      html.replace(/<style[\s\S]*?<\/style>/gi, " ")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ").trim(),
     replyTo: REPLY_TO(),
     trackingSettings: {
       clickTracking: { enable: false, enableText: false },
@@ -67,13 +61,11 @@ function tplWrapper(innerHtml) {
   </div>`;
 }
 
-// ===============================
-// Helpers de contraseñas
-// ===============================
+// --- Helpers de contraseñas ---
 function hashPassword(plain) {
-  const salt = crypto.randomBytes(16).toString("hex");         // 32 chars
+  const salt = crypto.randomBytes(16).toString("hex"); // 32 chars
   const hash = crypto.createHash("sha256").update(salt + plain).digest("hex"); // 64 chars
-  return `${salt}:${hash}`; // total ~97
+  return `${salt}:${hash}`;
 }
 function verifyPassword(plain, stored) {
   const [salt, hash] = stored.includes(":") ? stored.split(":") : ["", stored];
@@ -84,20 +76,12 @@ function generarPasswordTemporal(len = 10) {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%*";
   return Array.from(crypto.randomFillSync(new Uint8Array(len))).map(b => chars[b % chars.length]).join("");
 }
-
-// ===============================
-// Config Reset por Código
-// ===============================
-const RESET_EXP_MIN = parseInt(process.env.RESET_EXP_MIN || "15");      // minutos de validez
-const RESET_MAX_INTENTOS = parseInt(process.env.RESET_MAX_INTENTOS || "5");
-function generarCodigo6() {
-  // 6 dígitos (puedes cambiar a alfanum si quieres)
-  return String(Math.floor(100000 + Math.random() * 900000));
+function generarCodigo(len = 6) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  return Array.from(crypto.randomFillSync(new Uint8Array(len))).map(b => chars[b % chars.length]).join("");
 }
 
-// ===============================
-// BD
-// ===============================
+// --- BD ---
 const conexion = mysql.createConnection({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
@@ -110,18 +94,17 @@ conexion.connect((error) => {
   console.log("Conexion exitosa a la base de datos");
 });
 
-// ===============================
-// Rutas básicas
-// ===============================
+// Asegurar columna para código si aún no existe (no expira, sin contador de intentos)
+conexion.query(
+  "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_codigo VARCHAR(16) NULL",
+  () => {}
+);
+
+// --- Rutas básicas ---
 app.get("/", (req, res) => { res.send("Bienvenido a mi servicio web"); });
 app.get("/health", (req, res) => { res.json({ ok: true, uptime: process.uptime() }); });
 
-// Arranque del server
-app.listen(PUERTO, () => { console.log("Servidor corriendo en el puerto " + PUERTO); });
-
-// ===============================
-// Correos específicos
-// ===============================
+// --- Correos específicos ---
 async function enviarCorreo(destinatario, fecha, hora) {
   await enviarMail({
     to: destinatario,
@@ -194,26 +177,8 @@ async function enviarCorreoCancelacion(destinatario, fecha, hora) {
   });
   console.log("📧 Cancelación enviada a", destinatario);
 }
-// Correo: código de reseteo
-async function enviarCorreoCodigoReset(destinatario, nombre, codigo, minutos) {
-  await enviarMail({
-    to: destinatario,
-    subject: "Tu código para cambiar la contraseña",
-    html: tplWrapper(`
-      <h2 style="margin:0 0 8px 0;">Código de verificación</h2>
-      <p>Hola <strong>${nombre}</strong>, usa este código para cambiar tu contraseña:</p>
-      <p style="font-size:20px;letter-spacing:2px;"><strong>${codigo}</strong></p>
-      <p>Expira en <strong>${minutos} minutos</strong>. Si no fuiste tú, ignora este correo.</p>
-    `),
-    text: `Código de verificación: ${codigo}. Expira en ${minutos} minutos.`,
-    category: "reset-codigo",
-  });
-  console.log("📧 Código de reset enviado a", destinatario);
-}
 
-// ===============================
-// Endpoint test correo
-// ===============================
+// --- Endpoint test correo ---
 app.get("/test-correo", async (req, res) => {
   try {
     const to = process.env.TEST_TO || (process.env.EMAIL_FROM?.match(/<(.+)>/) || [])[1] || "pruebascalendar0@gmail.com";
@@ -230,20 +195,68 @@ app.get("/test-correo", async (req, res) => {
   }
 });
 
-// ===============================
-// === Usuarios ===
-// ===============================
-app.get("/usuarios", (req, res) => {
-  const consulta = `
-    SELECT id_usuario,usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_tipo
-    FROM usuarios
-    ORDER BY id_usuario ASC`;
-  conexion.query(consulta, (error, rpta) => {
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ listaUsuarios: rpta });
+/* ===================== USUARIOS ===================== */
+
+// LOGIN NUEVO (usado por la app)
+app.post("/usuario/login", (req, res) => {
+  const { usuario_correo, password } = req.body || {};
+  if (!usuario_correo || !password) return res.status(400).json({ mensaje: "Correo y password requeridos" });
+
+  const sql = "SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo, usuario_contrasena_hash FROM usuarios WHERE usuario_correo = ?";
+  conexion.query(sql, [usuario_correo], (err, rows) => {
+    if (err) return res.status(500).json({ mensaje: "Error en la base de datos" });
+    if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
+
+    const u = rows[0];
+    const ok = verifyPassword(password, u.usuario_contrasena_hash);
+    if (!ok) return res.status(401).json({ mensaje: "Contraseña incorrecta" });
+
+    // devolver datos públicos sin hash
+    const out = {
+      id_usuario: u.id_usuario,
+      usuario_nombre: u.usuario_nombre,
+      usuario_apellido: u.usuario_apellido,
+      usuario_correo: u.usuario_correo,
+      usuario_tipo: u.usuario_tipo,
+    };
+    res.json(out);
   });
 });
 
+// Recuperar correo por DNI/nombre/apellido (flujo antiguo)
+app.post("/usuario/recuperar-correo", (req, res) => {
+  const { usuario_dni, usuario_nombre, usuario_apellido } = req.body;
+  const consulta = `
+    SELECT usuario_correo FROM usuarios
+    WHERE usuario_dni = ? AND usuario_nombre = ? AND usuario_apellido = ?`;
+  conexion.query(consulta, [usuario_dni, usuario_nombre, usuario_apellido], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error interno del servidor" });
+    if (rows.length === 0) return res.status(404).json({ mensaje: "Usuario no encontrado" });
+    res.json({ correo: rows[0].usuario_correo });
+  });
+});
+
+// Reset por contraseña temporal (flujo antiguo)
+app.post("/usuario/recuperar-contrasena", (req, res) => {
+  const { usuario_correo } = req.body;
+  const q = "SELECT id_usuario, usuario_nombre, usuario_apellido FROM usuarios WHERE usuario_correo = ?";
+  conexion.query(q, [usuario_correo], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error interno del servidor" });
+    if (rows.length === 0) return res.status(404).json({ mensaje: "Correo no registrado" });
+
+    const { id_usuario, usuario_nombre, usuario_apellido } = rows[0];
+    const temp = generarPasswordTemporal(10);
+    const hashed = hashPassword(temp);
+    conexion.query("UPDATE usuarios SET usuario_contrasena_hash=? WHERE id_usuario=?", [hashed, id_usuario], (e2) => {
+      if (e2) return res.status(500).json({ error: "No se pudo actualizar la contraseña" });
+      const nombre = `${usuario_nombre} ${usuario_apellido}`;
+      enviarCorreoRecuperacion(usuario_correo, nombre, temp).catch(() => {});
+      res.json({ mensaje: "Se envió una contraseña temporal a tu correo" });
+    });
+  });
+});
+
+// Registro simple
 app.post("/usuario/agregar", (req, res) => {
   const u = {
     usuario_dni: req.body.usuario_dni,
@@ -270,7 +283,6 @@ app.post("/usuario/agregar", (req, res) => {
   const sql = "INSERT INTO usuarios SET ?";
   conexion.query(sql, row, (error) => {
     if (error) {
-      console.error("❌ Error INSERT usuarios:", { code: error.code, errno: error.errno, sqlMessage: error.sqlMessage });
       if (error.code === "ER_DUP_ENTRY") {
         if (error.sqlMessage?.includes("usuario_dni")) return res.status(400).json({ mensaje: "DNI ya está registrado" });
         if (error.sqlMessage?.includes("usuario_correo")) return res.status(400).json({ mensaje: "El correo ya está registrado." });
@@ -288,100 +300,71 @@ app.post("/usuario/agregar", (req, res) => {
   });
 });
 
-app.put("/usuario/actualizar/:id", (req, res) => {
-  const { id } = req.params;
-  const { usuario_nombre, usuario_apellido, usuario_correo } = req.body;
-  if (!usuario_nombre || !usuario_apellido || !usuario_correo) return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
-
-  const verificar = "SELECT 1 FROM usuarios WHERE usuario_correo = ? AND id_usuario != ?";
-  conexion.query(verificar, [usuario_correo, id], (err, rows) => {
-    if (err) return res.status(500).json({ mensaje: "Error al verificar correo" });
-    if (rows.length > 0) return res.status(409).json({ mensaje: "El correo ya está en uso por otro usuario" });
-
-    const actualizar = "UPDATE usuarios SET usuario_nombre=?, usuario_apellido=?, usuario_correo=? WHERE id_usuario=?";
-    conexion.query(actualizar, [usuario_nombre, usuario_apellido, usuario_correo, id], (e2) => {
-      if (e2) return res.status(500).json({ mensaje: "Error al actualizar usuario" });
-      res.status(200).json({ mensaje: "Usuario actualizado correctamente" });
-    });
-  });
-});
-
-// Recuperar correo por DNI/Nombre/Apellido
-app.post("/usuario/recuperar-correo", (req, res) => {
-  const { usuario_dni, usuario_nombre, usuario_apellido } = req.body;
+// Buscar usuario por correo (útil para flows antiguos)
+app.get("/usuario/:correo", (req, res) => {
+  const correo = decodeURIComponent(req.params.correo);
   const consulta = `
-    SELECT usuario_correo FROM usuarios
-    WHERE usuario_dni = ? AND usuario_nombre = ? AND usuario_apellido = ?`;
-  conexion.query(consulta, [usuario_dni, usuario_nombre, usuario_apellido], (err, rows) => {
-    if (err) return res.status(500).json({ error: "Error interno del servidor" });
-    if (rows.length === 0) return res.status(404).json({ mensaje: "Usuario no encontrado" });
-    res.json({ correo: rows[0].usuario_correo });
+    SELECT id_usuario,usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_tipo
+    FROM usuarios WHERE usuario_correo = ?`;
+  conexion.query(consulta, [correo], (error, rows) => {
+    if (error) return res.status(500).send(error.message);
+    if (rows.length > 0) res.json(rows[0]);
+    else res.status(404).send({ mensaje: "no hay registros" });
   });
 });
 
-// === Flujo clásico: enviar contraseña temporal (se mantiene por compatibilidad)
-app.post("/usuario/recuperar-contrasena", (req, res) => {
-  const { usuario_correo } = req.body;
-  const q = "SELECT id_usuario, usuario_nombre, usuario_apellido FROM usuarios WHERE usuario_correo = ?";
-  conexion.query(q, [usuario_correo], (err, rows) => {
-    if (err) return res.status(500).json({ error: "Error interno del servidor" });
-    if (rows.length === 0) return res.status(404).json({ mensaje: "Correo no registrado" });
-
-    const { id_usuario, usuario_nombre, usuario_apellido } = rows[0];
-    const temp = generarPasswordTemporal(10);
-    const hashed = hashPassword(temp);
-    conexion.query("UPDATE usuarios SET usuario_contrasena_hash=? WHERE id_usuario=?", [hashed, id_usuario], (e2) => {
-      if (e2) return res.status(500).json({ error: "No se pudo actualizar la contraseña" });
-      const nombre = `${usuario_nombre} ${usuario_apellido}`;
-      enviarCorreoRecuperacion(usuario_correo, nombre, temp).catch(() => {});
-      res.json({ mensaje: "Se envió una contraseña temporal a tu correo" });
-    });
-  });
-});
-
-// === Nuevo flujo: Reset por CÓDIGO (solicitar → validar → cambiar) ===
-
-// Paso 1: Solicitar código (sin expiración ni intentos)
+/* =========== RESET CON CÓDIGO (sin límite de intentos ni expiración) =========== */
+// 1) Solicitar código
 app.post("/usuario/reset/solicitar", (req, res) => {
-  const { usuario_correo } = req.body;
+  const { usuario_correo } = req.body || {};
   if (!usuario_correo) return res.status(400).json({ mensaje: "Correo requerido" });
 
-  const q = "SELECT id_usuario, usuario_nombre, usuario_apellido FROM usuarios WHERE usuario_correo = ?";
-  conexion.query(q, [usuario_correo], async (err, rows) => {
-    if (err) return res.status(500).json({ mensaje: "Error interno del servidor" });
-    if (rows.length === 0) return res.status(404).json({ mensaje: "Correo no registrado" });
+  conexion.query("SELECT id_usuario, usuario_nombre, usuario_apellido FROM usuarios WHERE usuario_correo = ?", [usuario_correo], (err, rows) => {
+    if (err) return res.status(500).json({ mensaje: "Error en la base de datos" });
+    if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
 
-    const { id_usuario, usuario_nombre, usuario_apellido } = rows[0];
+    const codigo = generarCodigo(6);
+    conexion.query("UPDATE usuarios SET reset_codigo=? WHERE usuario_correo=?", [codigo, usuario_correo], (e2) => {
+      if (e2) return res.status(500).json({ mensaje: "No se pudo guardar el código" });
 
-    const generarCodigo6 = () => String(Math.floor(100000 + Math.random() * 900000));
-    const codigo = generarCodigo6();
-
-    const upd = `UPDATE usuarios SET reset_codigo=?, reset_used=0 WHERE id_usuario=?`;
-    conexion.query(upd, [codigo, id_usuario], async (e2) => {
-      if (e2) return res.status(500).json({ mensaje: "No se pudo generar el código" });
-      try {
-        await enviarCorreoCodigoReset(usuario_correo, `${usuario_nombre} ${usuario_apellido}`, codigo, ""); // el texto de minutos ya no aplica
-      } catch (_) {}
-      res.json({ mensaje: "Código enviado a tu correo" });
+      const nombre = `${rows[0].usuario_nombre} ${rows[0].usuario_apellido}`;
+      const html = tplWrapper(`
+        <h2 style="margin:0 0 8px 0;">Código para cambiar tu contraseña</h2>
+        <p>Hola <strong>${nombre}</strong>, este es tu código:</p>
+        <p style="font-size:24px;letter-spacing:3px"><strong>${codigo}</strong></p>
+        <p>Ingresa el código en la app y define tu nueva contraseña.</p>
+      `);
+      enviarMail({ to: usuario_correo, subject: "Tu código de verificación", html, category: "reset-codigo" })
+        .then(() => res.json({ ok: true }))
+        .catch(() => res.json({ ok: true })); // no romper si el correo falla
     });
   });
 });
 
-// Paso 2: Validar (opcional)
-app.post("/usuario/reset/validar", (req, res) => {
-  const { usuario_correo, codigo } = req.body;
-  if (!usuario_correo || !codigo) return res.status(400).json({ mensaje: "Datos incompletos" });
-
-  const q = `SELECT id_usuario, reset_codigo, reset_used FROM usuarios WHERE usuario_correo=?`;
+// 2) Cambiar con código
+app.post("/usuario/reset/cambiar", (req, res) => {
+  const { usuario_correo, codigo, nueva_contrasena } = req.body || {};
+  if (!usuario_correo || !codigo || !nueva_contrasena) {
+    return res.status(400).json({ mensaje: "correo, codigo y nueva_contrasena son requeridos" });
+  }
+  const q = "SELECT id_usuario, reset_codigo FROM usuarios WHERE usuario_correo = ?";
   conexion.query(q, [usuario_correo], (err, rows) => {
-    if (err) return res.status(500).json({ mensaje: "Error interno del servidor" });
-    if (rows.length === 0) return res.status(404).json({ mensaje: "Correo no registrado" });
+    if (err) return res.status(500).json({ mensaje: "Error en la base de datos" });
+    if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
 
     const u = rows[0];
-    if (!u.reset_codigo || u.reset_used) return res.status(400).json({ valido: false, mensaje: "No hay un código vigente. Solicítalo de nuevo." });
-    if (u.reset_codigo !== String(codigo)) return res.status(400).json({ valido: false, mensaje: "Código incorrecto" });
+    if (!u.reset_codigo || u.reset_codigo !== codigo) {
+      return res.status(401).json({ mensaje: "Código inválido" });
+    }
 
-    return res.json({ valido: true, mensaje: "Código válido" });
+    const hashed = hashPassword(nueva_contrasena);
+    conexion.query("UPDATE usuarios SET usuario_contrasena_hash=?, reset_codigo=NULL WHERE id_usuario=?",
+      [hashed, u.id_usuario],
+      (e2) => {
+        if (e2) return res.status(500).json({ mensaje: "No se pudo actualizar la contraseña" });
+        res.json({ ok: true, mensaje: "Contraseña actualizada" });
+      }
+    );
   });
 });
 
@@ -814,3 +797,8 @@ module.exports = {
   hashPassword,
   verifyPassword,
 };
+
+// --- Start ---
+app.listen(PUERTO, () => {
+  console.log("Servidor corriendo en el puerto " + PUERTO);
+});
