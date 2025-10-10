@@ -2,20 +2,18 @@
   "name": "servicio_web",
   "version": "1.0.0",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
+  "description": "API Clinica - Render + MySQL + SendGrid",
   "author": "Grupo 4 - AppMoviles",
   "license": "ISC",
-  "description": "",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
   "dependencies": {
-    "body-parser": "^1.20.3",
     "dotenv": "^16.5.0",
-    "express": "^4.21.0",
+    "express": "^4.21.2",
     "mysql2": "^3.11.3",
-    "nodemailer": "^6.10.1"
+    "@sendgrid/mail": "^7.7.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.7"
