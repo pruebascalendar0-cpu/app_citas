@@ -94,7 +94,7 @@ conexion.connect((error) => {
   console.log("Conexion exitosa a la base de datos");
 });
 
-// Asegurar columna para código si aún no existe (no expira, sin contador de intentos)
+// Campo para código de reseteo (sin expiración/contadores)
 conexion.query(
   "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS reset_codigo VARCHAR(16) NULL",
   () => {}
@@ -104,7 +104,7 @@ conexion.query(
 app.get("/", (req, res) => { res.send("Bienvenido a mi servicio web"); });
 app.get("/health", (req, res) => { res.json({ ok: true, uptime: process.uptime() }); });
 
-// --- Correos específicos ---
+/* ===================== Correos de citas / bienvenida ===================== */
 async function enviarCorreo(destinatario, fecha, hora) {
   await enviarMail({
     to: destinatario,
@@ -197,7 +197,7 @@ app.get("/test-correo", async (req, res) => {
 
 /* ===================== USUARIOS ===================== */
 
-// LOGIN NUEVO (usado por la app)
+// LOGIN (usado por la app)
 app.post("/usuario/login", (req, res) => {
   const { usuario_correo, password } = req.body || {};
   if (!usuario_correo || !password) return res.status(400).json({ mensaje: "Correo y password requeridos" });
@@ -211,21 +211,19 @@ app.post("/usuario/login", (req, res) => {
     const ok = verifyPassword(password, u.usuario_contrasena_hash);
     if (!ok) return res.status(401).json({ mensaje: "Contraseña incorrecta" });
 
-    // devolver datos públicos sin hash
-    const out = {
+    res.json({
       id_usuario: u.id_usuario,
       usuario_nombre: u.usuario_nombre,
       usuario_apellido: u.usuario_apellido,
       usuario_correo: u.usuario_correo,
       usuario_tipo: u.usuario_tipo,
-    };
-    res.json(out);
+    });
   });
 });
 
-// Recuperar correo por DNI/nombre/apellido (flujo antiguo)
+// Recuperar correo por DNI/nombre/apellido
 app.post("/usuario/recuperar-correo", (req, res) => {
-  const { usuario_dni, usuario_nombre, usuario_apellido } = req.body;
+  const { usuario_dni, usuario_nombre, usuario_apellido } = req.body || {};
   const consulta = `
     SELECT usuario_correo FROM usuarios
     WHERE usuario_dni = ? AND usuario_nombre = ? AND usuario_apellido = ?`;
@@ -236,9 +234,9 @@ app.post("/usuario/recuperar-correo", (req, res) => {
   });
 });
 
-// Reset por contraseña temporal (flujo antiguo)
+// Reset por contraseña temporal (opcional, antiguo)
 app.post("/usuario/recuperar-contrasena", (req, res) => {
-  const { usuario_correo } = req.body;
+  const { usuario_correo } = req.body || {};
   const q = "SELECT id_usuario, usuario_nombre, usuario_apellido FROM usuarios WHERE usuario_correo = ?";
   conexion.query(q, [usuario_correo], (err, rows) => {
     if (err) return res.status(500).json({ error: "Error interno del servidor" });
@@ -256,7 +254,7 @@ app.post("/usuario/recuperar-contrasena", (req, res) => {
   });
 });
 
-// Registro simple
+// Registrar usuario simple
 app.post("/usuario/agregar", (req, res) => {
   const u = {
     usuario_dni: req.body.usuario_dni,
@@ -280,8 +278,7 @@ app.post("/usuario/agregar", (req, res) => {
     usuario_tipo: 1,
   };
 
-  const sql = "INSERT INTO usuarios SET ?";
-  conexion.query(sql, row, (error) => {
+  conexion.query("INSERT INTO usuarios SET ?", row, (error) => {
     if (error) {
       if (error.code === "ER_DUP_ENTRY") {
         if (error.sqlMessage?.includes("usuario_dni")) return res.status(400).json({ mensaje: "DNI ya está registrado" });
@@ -296,11 +293,11 @@ app.post("/usuario/agregar", (req, res) => {
 
     const nombreCompleto = `${row.usuario_nombre} ${row.usuario_apellido}`;
     enviarCorreoBienvenida(row.usuario_correo, nombreCompleto).catch(() => {});
-    return res.json({ mensaje: "Usuario registrado correctamente." });
+    res.json({ mensaje: "Usuario registrado correctamente." });
   });
 });
 
-// Buscar usuario por correo (útil para flows antiguos)
+// Buscar usuario por correo (para flujos antiguos que aún lo usan)
 app.get("/usuario/:correo", (req, res) => {
   const correo = decodeURIComponent(req.params.correo);
   const consulta = `
@@ -313,7 +310,7 @@ app.get("/usuario/:correo", (req, res) => {
   });
 });
 
-/* =========== RESET CON CÓDIGO (sin límite de intentos ni expiración) =========== */
+/* =========== RESET CON CÓDIGO (sin expiración ni intentos) =========== */
 // 1) Solicitar código
 app.post("/usuario/reset/solicitar", (req, res) => {
   const { usuario_correo } = req.body || {};
@@ -336,7 +333,7 @@ app.post("/usuario/reset/solicitar", (req, res) => {
       `);
       enviarMail({ to: usuario_correo, subject: "Tu código de verificación", html, category: "reset-codigo" })
         .then(() => res.json({ ok: true }))
-        .catch(() => res.json({ ok: true })); // no romper si el correo falla
+        .catch(() => res.json({ ok: true })); // no romper si el envío falla
     });
   });
 });
@@ -353,12 +350,13 @@ app.post("/usuario/reset/cambiar", (req, res) => {
     if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
 
     const u = rows[0];
-    if (!u.reset_codigo || u.reset_codigo !== codigo) {
+    if (!u.reset_codigo || u.reset_codigo !== String(codigo)) {
       return res.status(401).json({ mensaje: "Código inválido" });
     }
 
-    const hashed = hashPassword(nueva_contrasena);
-    conexion.query("UPDATE usuarios SET usuario_contrasena_hash=?, reset_codigo=NULL WHERE id_usuario=?",
+    const hashed = hashPassword(String(nueva_contrasena));
+    conexion.query(
+      "UPDATE usuarios SET usuario_contrasena_hash=?, reset_codigo=NULL WHERE id_usuario=?",
       [hashed, u.id_usuario],
       (e2) => {
         if (e2) return res.status(500).json({ mensaje: "No se pudo actualizar la contraseña" });
@@ -368,95 +366,7 @@ app.post("/usuario/reset/cambiar", (req, res) => {
   });
 });
 
-// Paso 3: Cambiar contraseña (sin expiración ni intentos)
-app.post("/usuario/reset/cambiar", (req, res) => {
-  const { usuario_correo, codigo, nueva_contrasena } = req.body;
-  if (!usuario_correo || !codigo || !nueva_contrasena) return res.status(400).json({ mensaje: "Datos incompletos" });
-  if (String(nueva_contrasena).length < 6) return res.status(400).json({ mensaje: "La contraseña debe tener al menos 6 caracteres." });
-
-  const q = `SELECT id_usuario, reset_codigo, reset_used FROM usuarios WHERE usuario_correo=?`;
-  conexion.query(q, [usuario_correo], (err, rows) => {
-    if (err) return res.status(500).json({ mensaje: "Error interno del servidor" });
-    if (rows.length === 0) return res.status(404).json({ mensaje: "Correo no registrado" });
-
-    const u = rows[0];
-    if (!u.reset_codigo || u.reset_used) return res.status(400).json({ mensaje: "No hay un código vigente. Solicítalo de nuevo." });
-    if (u.reset_codigo !== String(codigo)) return res.status(400).json({ mensaje: "Código incorrecto" });
-
-    const hashed = hashPassword(nueva_contrasena);
-    const upd = `UPDATE usuarios SET usuario_contrasena_hash=?, reset_used=1, reset_codigo=NULL WHERE id_usuario=?`;
-    conexion.query(upd, [hashed, u.id_usuario], (e2) => {
-      if (e2) return res.status(500).json({ mensaje: "No se pudo actualizar la contraseña" });
-      res.json({ mensaje: "Contraseña actualizada correctamente" });
-    });
-  });
-});
-
-    // Código correcto → cambiar contraseña y marcar usado
-    const hashed = hashPassword(nueva_contrasena);
-    const upd = `
-      UPDATE usuarios
-        SET usuario_contrasena_hash=?, reset_used=1, reset_intentos=0
-      WHERE id_usuario=?`;
-    conexion.query(upd, [hashed, u.id_usuario], (e2) => {
-      if (e2) return res.status(500).json({ mensaje: "No se pudo actualizar la contraseña" });
-      // opcional: limpiar código/expiración
-      conexion.query("UPDATE usuarios SET reset_codigo=NULL, reset_expires=NULL WHERE id_usuario=?", [u.id_usuario], () => {});
-      res.json({ mensaje: "Contraseña actualizada correctamente" });
-    });
-  });
-});
-
-// Registrar usuario genérico (incluye médicos si usuario_tipo=2)
-app.post("/usuario/registrar", (req, res) => {
-  const { usuario_nombre, usuario_apellido, usuario_correo, usuario_dni, usuario_contrasena, usuario_tipo, id_especialidad } = req.body;
-  if (!usuario_nombre || !usuario_apellido || !usuario_correo || !usuario_dni || !usuario_contrasena || usuario_tipo === undefined) {
-    return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
-  }
-  const nuevo = {
-    usuario_nombre,
-    usuario_apellido,
-    usuario_correo,
-    usuario_dni,
-    usuario_contrasena_hash: hashPassword(usuario_contrasena),
-    usuario_tipo,
-  };
-  conexion.query("INSERT INTO usuarios SET ?", nuevo, (error, resultados) => {
-    if (error) {
-      if (error.code === "ER_DUP_ENTRY") {
-        if (error.sqlMessage.includes("usuario_dni")) return res.status(400).json({ mensaje: "DNI ya está registrado" });
-        if (error.sqlMessage.includes("usuario_correo")) return res.status(400).json({ mensaje: "El correo ya está registrado." });
-        return res.status(400).json({ mensaje: "Datos duplicados" });
-      }
-      return res.status(500).json({ mensaje: "Error al registrar usuario" });
-    }
-    const id_usuario = resultados.insertId;
-    if (usuario_tipo === 2 && id_especialidad) {
-      conexion.query("INSERT INTO medicos (id_medico, id_especialidad) VALUES (?, ?)", [id_usuario, id_especialidad], (e2) => {
-        if (e2) return res.status(201).json({ mensaje: "Usuario registrado, pero no se pudo asignar la especialidad", id_usuario });
-        res.status(201).json({ mensaje: "Médico registrado correctamente", id_usuario });
-      });
-    } else {
-      res.status(201).json({ mensaje: "Usuario registrado correctamente", id_usuario });
-    }
-  });
-});
-
-app.get("/usuario/:correo", (req, res) => {
-  const correo = decodeURIComponent(req.params.correo);
-  const consulta = `
-    SELECT id_usuario,usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_tipo
-    FROM usuarios WHERE usuario_correo = ?`;
-  conexion.query(consulta, [correo], (error, rows) => {
-    if (error) return res.status(500).send(error.message);
-    if (rows.length > 0) res.json(rows[0]);
-    else res.status(404).send({ mensaje: "no hay registros" });
-  });
-});
-
-// ===============================
-// === Médicos / Especialidades / Horarios ===
-// ===============================
+/* ===================== Médicos / Especialidades / Horarios ===================== */
 app.get("/especialidades", (req, res) => {
   conexion.query("SELECT * FROM especialidades", (error, rpta) => {
     if (error) return res.status(500).json({ error: error.message });
@@ -484,7 +394,7 @@ app.get("/horarios/:parametro", (req, res) => {
 
 app.put("/horario/actualizar/:id_horario", (req, res) => {
   const { id_horario } = req.params;
-  const { id_medico, fecha_nueva, hora_nueva, id_especialidad } = req.body;
+  const { id_medico, fecha_nueva, hora_nueva, id_especialidad } = req.body || {};
   if (!id_medico || !fecha_nueva || !hora_nueva || !id_especialidad) return res.status(400).json({ mensaje: "Datos incompletos para actualizar el horario" });
 
   const qOld = "SELECT horario_fecha, horario_hora FROM horarios_medicos WHERE id_horario = ?";
@@ -503,13 +413,12 @@ app.put("/horario/actualizar/:id_horario", (req, res) => {
 });
 
 app.post("/horario/registrar", (req, res) => {
-  const { id_medico, horario_horas, horario_fecha, id_especialidad } = req.body;
+  const { id_medico, horario_horas, horario_fecha, id_especialidad } = req.body || {};
   if (!id_medico || !horario_horas || !horario_fecha || !id_especialidad) return res.status(400).json({ error: "Faltan datos obligatorios" });
-  const horario_estado = 0;
   const consulta = `
-    INSERT INTO horarios_medicos (id_medico, horario_hora, horario_fecha, horario_estado, id_especialidad)
-    VALUES (?, ?, ?, ?, ?)`;
-  conexion.query(consulta, [id_medico, horario_horas, horario_fecha, horario_estado, id_especialidad], (error, r) => {
+    INSERT INTO horarios_medicos (id_medico, horario_hora, horario_fecha, id_especialidad)
+    VALUES (?, ?, ?, ?)`;
+  conexion.query(consulta, [id_medico, horario_horas, horario_fecha, id_especialidad], (error, r) => {
     if (error) {
       if (error.code === "ER_DUP_ENTRY") return res.status(400).json({ error: "Ese horario ya fue registrado para este médico." });
       return res.status(500).json({ error: "Error interno al registrar el horario" });
@@ -559,11 +468,9 @@ app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", (req, res) =
   });
 });
 
-// ===============================
-// === Citas ===
-// ===============================
+/* ===================== Citas ===================== */
 app.post("/cita/agregar", (req, res) => {
-  const { id_usuario, id_medico, cita_fecha, cita_hora } = req.body;
+  const { id_usuario, id_medico, cita_fecha, cita_hora } = req.body || {};
   const consultaOrden = "SELECT COUNT(*) AS total FROM citas WHERE id_usuario = ?";
   conexion.query(consultaOrden, [id_usuario], (error, results) => {
     if (error) return res.status(500).json({ error: "Error al calcular número de orden" });
@@ -585,7 +492,7 @@ app.post("/cita/agregar", (req, res) => {
 
 app.put("/cita/actualizar/:id", (req, res) => {
   const { id } = req.params;
-  const { id_usuario, id_medico, cita_fecha, cita_hora, cita_estado } = req.body;
+  const { id_usuario, id_medico, cita_fecha, cita_hora, cita_estado } = req.body || {};
   if (!id_usuario || !id_medico || !cita_fecha || !cita_hora) return res.status(400).json({ mensaje: "Datos incompletos para actualizar la cita" });
 
   conexion.query("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], (e0, rows) => {
@@ -768,7 +675,7 @@ app.get("/medicos", (req, res) => {
 });
 
 app.post("/especialidad/agregar", (req, res) => {
-  const { especialidad_nombre } = req.body;
+  const { especialidad_nombre } = req.body || {};
   if (!especialidad_nombre) return res.status(400).json({ error: "Nombre requerido" });
   conexion.query("INSERT INTO especialidades (especialidad_nombre) VALUES (?)", [especialidad_nombre], (err) => {
     if (err) return res.status(500).json({ error: "Error al guardar especialidad" });
@@ -777,7 +684,7 @@ app.post("/especialidad/agregar", (req, res) => {
 });
 app.put("/especialidad/actualizar/:id", (req, res) => {
   const { id } = req.params;
-  const { especialidad_nombre } = req.body;
+  const { especialidad_nombre } = req.body || {};
   if (!especialidad_nombre) return res.status(400).json({ mensaje: "Nombre requerido" });
   conexion.query("UPDATE especialidades SET especialidad_nombre=? WHERE id_especialidad=?", [especialidad_nombre, id], (err) => {
     if (err) return res.status(500).json({ error: "Error al actualizar especialidad" });
@@ -785,9 +692,7 @@ app.put("/especialidad/actualizar/:id", (req, res) => {
   });
 });
 
-// ===============================
-// Exports opcionales
-// ===============================
+/* ===================== Exports opcionales ===================== */
 module.exports = {
   enviarCorreo,
   enviarCorreoBienvenida,
