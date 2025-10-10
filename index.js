@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express")
@@ -13,12 +12,28 @@ const PUERTO = process.env.PORT || 3000;
 app.use(bodyParser.json())
 
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  host: "smtp.gmail.com",
+  port: 587,           // STARTTLS
+  secure: false,       // importante: false en 587
   auth: {
     user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD,
+    pass: process.env.EMAIL_PASSWORD, // App Password SIN espacios
   },
+  // Forzar IPv4 y dar más tiempo a la conexión
+  family: 4,
+  connectionTimeout: 30000,  // 30s
+  socketTimeout: 30000,
+  tls: {
+    minVersion: "TLSv1.2",
+    rejectUnauthorized: true,
+  },
+  logger: true,  // logs detallados al servidor
+  debug: true,   // logs del protocolo
 });
+
+transporter.verify()
+  .then(() => console.log("✅ SMTP listo para enviar"))
+  .catch(err => console.error("❌ SMTP error:", err));
 
 function correoFrom(nombre = "Clínica Salud Total") {
   return `"${nombre}" <${process.env.EMAIL_USER}>`;
