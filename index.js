@@ -65,9 +65,9 @@ function tplWrapper(innerHtml) {
 
 // --- Helpers de contraseñas ---
 function hashPassword(plain) {
-  const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto.createHash("sha256").update(salt + plain).digest("hex");
-  return `${salt}:${hash}`; // almacena salt:hash
+  const salt = crypto.randomBytes(16).toString("hex");         // 32 chars
+  const hash = crypto.createHash("sha256").update(salt + plain).digest("hex"); // 64 chars
+  return `${salt}:${hash}`; // total ~97
 }
 function verifyPassword(plain, stored) {
   const [salt, hash] = stored.includes(":") ? stored.split(":") : ["", stored];
@@ -233,7 +233,6 @@ app.post("/usuario/agregar", (req, res) => {
         return res.status(400).json({ mensaje: "Datos duplicados" });
       }
       if (error.code === "ER_BAD_FIELD_ERROR") {
-        // indica que la columna no existe (revisa punto B)
         return res.status(500).json({ mensaje: "Columna inválida en BD (verificar usuario_contrasena_hash)." });
       }
       return res.status(500).json({ mensaje: "Error al registrar usuario." });
@@ -275,7 +274,7 @@ app.post("/usuario/recuperar-correo", (req, res) => {
   });
 });
 
-// En vez de "enviar la contraseña", generamos una temporal, la guardamos hasheada y la enviamos
+// Genera una clave temporal, la guarda hasheada y la envía por correo
 app.post("/usuario/recuperar-contrasena", (req, res) => {
   const { usuario_correo } = req.body;
   const q = "SELECT id_usuario, usuario_nombre, usuario_apellido FROM usuarios WHERE usuario_correo = ?";
@@ -644,7 +643,6 @@ app.get("/citas", (req, res) => {
   });
 });
 
-// Listado simple de medicos (tabla cruda)
 app.get("/medicos", (req, res) => {
   conexion.query("SELECT * FROM medicos", (error, rpta) => {
     if (error) return res.status(500).json({ error: error.message });
@@ -652,7 +650,6 @@ app.get("/medicos", (req, res) => {
   });
 });
 
-// Especialidades CRUD básico
 app.post("/especialidad/agregar", (req, res) => {
   const { especialidad_nombre } = req.body;
   if (!especialidad_nombre) return res.status(400).json({ error: "Nombre requerido" });
@@ -671,7 +668,7 @@ app.put("/especialidad/actualizar/:id", (req, res) => {
   });
 });
 
-// Opcional: exportar helpers si lo usas en otros módulos
+// Opcional: exportar helpers si los usas en otros módulos
 module.exports = {
   enviarCorreo,
   enviarCorreoBienvenida,
