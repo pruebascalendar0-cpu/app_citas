@@ -3,43 +3,26 @@ require("dotenv").config();
 
 const express = require("express");
 const mysql = require("mysql2");
+const crypto = require("crypto");
 const sg = require("@sendgrid/mail");
 
-// Express / Ap
+// --- App / Express ---
 const app = express();
 const PUERTO = process.env.PORT || 3000;
 app.use(express.json());
 
-// SendGrid
+// --- SendGrid ---
 sg.setApiKey(process.env.SENDGRID_API_KEY);
-
-function FROM() {
-  return process.env.EMAIL_FROM || 'Clínica Salud Total <pruebascalendar0@gmail.com>';
-}
-
-function REPLY_TO() {
-  return process.env.REPLY_TO || 'pruebascalendar0@gmail.com';
-}
-
-// Cabeceras 
+function FROM() { return process.env.EMAIL_FROM || "Clínica Salud Total <pruebascalendar0@gmail.com>"; }
+function REPLY_TO() { return process.env.REPLY_TO || "pruebascalendar0@gmail.com"; }
 function listUnsubHeaders() {
   const items = [];
   if (process.env.UNSUB_MAILTO) items.push(`<mailto:${process.env.UNSUB_MAILTO}>`);
   if (process.env.UNSUB_URL) items.push(`<${process.env.UNSUB_URL}>`);
   return items.length ? { "List-Unsubscribe": items.join(", ") } : undefined;
 }
-
-/**
- * Envío centralizado con buenas prácticas anti-spam:
- * - Texto plano además del HTML
- * - Reply-To real
- * - Tracking desactivado (hasta tener Link Branding)
- * - Categoría para ver en Activity
- * - Manejo de errores mostrando body de SendGrid si existe
- */
 async function enviarMail({ to, subject, html, text, category = "notificaciones" }) {
   const headers = listUnsubHeaders();
-
   const msg = {
     from: FROM(),
     to,
@@ -59,27 +42,44 @@ async function enviarMail({ to, subject, html, text, category = "notificaciones"
       subscriptionTracking: { enable: false },
     },
     mailSettings: {
-      // Puedes activar sandbox con SENDGRID_SANDBOX=true para pruebas sin envío real
       sandboxMode: { enable: process.env.SENDGRID_SANDBOX === "true" },
     },
     categories: [category],
     headers,
   };
-
-  try {
-    await sg.send(msg);
-  } catch (err) {
-    // Muestra detalle de SendGrid si viene en response.body
-    if (err.response?.body) {
-      console.error("❌ SG Error:", JSON.stringify(err.response.body, null, 2));
-    } else {
-      console.error("❌ SG Error:", err);
-    }
+  try { await sg.send(msg); }
+  catch (err) {
+    if (err.response?.body) console.error("❌ SG Error:", JSON.stringify(err.response.body, null, 2));
+    else console.error("❌ SG Error:", err);
     throw err;
   }
 }
+function tplWrapper(innerHtml) {
+  return `
+  <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;line-height:1.5;color:#222;max-width:560px">
+    ${innerHtml}
+    <hr style="border:none;border-top:1px solid #eee;margin:16px 0" />
+    <div style="font-size:12px;color:#777">Clínica Salud Total · Mensaje automático. Si no esperabas este correo, ignóralo.</div>
+  </div>`;
+}
 
-// BD
+// --- Helpers de contraseñas ---
+function hashPassword(plain) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.createHash("sha256").update(salt + plain).digest("hex");
+  return `${salt}:${hash}`; // almacena salt:hash
+}
+function verifyPassword(plain, stored) {
+  const [salt, hash] = stored.includes(":") ? stored.split(":") : ["", stored];
+  const test = crypto.createHash("sha256").update((salt || "") + plain).digest("hex");
+  return test === hash;
+}
+function generarPasswordTemporal(len = 10) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%*";
+  return Array.from(crypto.randomFillSync(new Uint8Array(len))).map(b => chars[b % chars.length]).join("");
+}
+
+// --- BD ---
 const conexion = mysql.createConnection({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
@@ -87,148 +87,94 @@ const conexion = mysql.createConnection({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
 });
-
 conexion.connect((error) => {
   if (error) throw error;
   console.log("Conexion exitosa a la base de datos");
 });
 
-// === Rutas básicas ===
-app.get("/", (req, res) => {
-  res.send("Bienvenido a mi servicio web");
-});
+// --- Rutas básicas ---
+app.get("/", (req, res) => { res.send("Bienvenido a mi servicio web"); });
+app.get("/health", (req, res) => { res.json({ ok: true, uptime: process.uptime() }); });
+app.listen(PUERTO, () => { console.log("Servidor corriendo en el puerto " + PUERTO); });
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
-});
-
-app.listen(PUERTO, () => {
-  console.log("Servidor corriendo en el puerto " + PUERTO);
-});
-
-// PLANTILLAS DE CORREO
-function tplWrapper(innerHtml) {
-  // HTML limpio, sin estilos agresivos, con pie simple
-  return `
-  <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; line-height:1.5; color:#222; max-width:560px">
-    ${innerHtml}
-    <hr style="border:none;border-top:1px solid #eee;margin:16px 0" />
-    <div style="font-size:12px;color:#777">
-      Clínica Salud Total · Mensaje automático. Si no esperabas este correo, puedes ignorarlo.
-    </div>
-  </div>`;
-}
-
-// Confirmación de cita
+// --- Correos específicos ---
 async function enviarCorreo(destinatario, fecha, hora) {
-  const subject = "Confirmación de tu cita médica";
-  const html = tplWrapper(`
-    <h2 style="margin:0 0 8px 0;">Cita médica confirmada</h2>
-    <p>Tu cita ha sido registrada con éxito.</p>
-    <p><strong>Fecha:</strong> ${fecha}<br/><strong>Hora:</strong> ${hora}</p>
-  `);
-
   await enviarMail({
     to: destinatario,
-    subject,
-    html,
+    subject: "Confirmación de tu cita médica",
+    html: tplWrapper(`
+      <h2 style="margin:0 0 8px 0;">Cita médica confirmada</h2>
+      <p>Tu cita ha sido registrada con éxito.</p>
+      <p><strong>Fecha:</strong> ${fecha}<br/><strong>Hora:</strong> ${hora}</p>
+    `),
     text: `Cita confirmada. Fecha: ${fecha}. Hora: ${hora}.`,
     category: "citas-confirmacion",
   });
-
   console.log("📧 Confirmación enviada a", destinatario);
 }
-
-// Bienvenida
 async function enviarCorreoBienvenida(destinatario, nombre) {
-  const subject = "Bienvenido a Clínica Salud Total";
-  const html = tplWrapper(`
-    <h2 style="margin:0 0 8px 0;">¡Bienvenido, ${nombre}!</h2>
-    <p>Tu registro en <strong>Clínica Salud Total</strong> fue exitoso.</p>
-    <p>Ya puedes ingresar y programar tus citas médicas.</p>
-  `);
-
   await enviarMail({
     to: destinatario,
-    subject,
-    html,
+    subject: "Bienvenido a Clínica Salud Total",
+    html: tplWrapper(`
+      <h2 style="margin:0 0 8px 0;">¡Bienvenido, ${nombre}!</h2>
+      <p>Tu registro en <strong>Clínica Salud Total</strong> fue exitoso.</p>
+      <p>Ya puedes ingresar y programar tus citas médicas.</p>
+    `),
     text: `Bienvenido, ${nombre}. Tu registro en Clínica Salud Total fue exitoso.`,
     category: "bienvenida",
   });
-
   console.log("📧 Bienvenida enviada a", destinatario);
 }
-
-// Recuperación de contraseña
-async function enviarCorreoRecuperacion(destinatario, nombre, contrasena) {
-  const subject = "Recuperación de contraseña – Clínica Salud Total";
-  const html = tplWrapper(`
-    <h2 style="margin:0 0 8px 0;">Recuperación de contraseña</h2>
-    <p>Hola <strong>${nombre}</strong>, atendimos tu solicitud de recuperación.</p>
-    <p><strong>Tu contraseña actual:</strong> ${contrasena}</p>
-    <p>Por seguridad, cámbiala después de iniciar sesión.</p>
-  `);
-
+async function enviarCorreoRecuperacion(destinatario, nombre, nuevaClaveTemporal) {
   await enviarMail({
     to: destinatario,
-    subject,
-    html,
-    text: `Recuperación de contraseña. Usuario: ${nombre}. Contraseña actual: ${contrasena}.`,
+    subject: "Restablecimiento de contraseña – Clínica Salud Total",
+    html: tplWrapper(`
+      <h2 style="margin:0 0 8px 0;">Contraseña temporal</h2>
+      <p>Hola <strong>${nombre}</strong>, generamos una clave temporal para que puedas ingresar.</p>
+      <p><strong>Contraseña temporal:</strong> ${nuevaClaveTemporal}</p>
+      <p>Por seguridad, cámbiala apenas inicies sesión.</p>
+    `),
+    text: `Contraseña temporal: ${nuevaClaveTemporal}. Cámbiala al iniciar sesión.`,
     category: "recuperacion",
   });
-
-  console.log("📧 Recuperación enviada a", destinatario);
+  console.log("📧 Recuperación (clave temporal) enviada a", destinatario);
 }
-
-// Actualización de cita
 async function enviarCorreoActualizacion(destinatario, fecha, hora) {
-  const subject = "Actualización de tu cita médica";
-  const html = tplWrapper(`
-    <h2 style="margin:0 0 8px 0;">Cita actualizada</h2>
-    <p>Hicimos un cambio en tu cita.</p>
-    <p><strong>Nueva fecha:</strong> ${fecha}<br/><strong>Hora:</strong> ${hora}</p>
-  `);
-
   await enviarMail({
     to: destinatario,
-    subject,
-    html,
+    subject: "Actualización de tu cita médica",
+    html: tplWrapper(`
+      <h2 style="margin:0 0 8px 0;">Cita actualizada</h2>
+      <p>Hicimos un cambio en tu cita.</p>
+      <p><strong>Nueva fecha:</strong> ${fecha}<br/><strong>Hora:</strong> ${hora}</p>
+    `),
     text: `Cita actualizada. Nueva fecha: ${fecha}. Hora: ${hora}.`,
     category: "citas-actualizacion",
   });
-
   console.log("📧 Actualización enviada a", destinatario);
 }
-
-//Cancelación de cita
 async function enviarCorreoCancelacion(destinatario, fecha, hora) {
-  const subject = "Cancelación de tu cita médica";
-  const html = tplWrapper(`
-    <h2 style="margin:0 0 8px 0;">Cita cancelada</h2>
-    <p>Se canceló tu cita.</p>
-    <p><strong>Fecha:</strong> ${fecha}<br/><strong>Hora:</strong> ${hora}</p>
-    <p>Si fue un error, agenda una nueva cita desde la app.</p>
-  `);
-
   await enviarMail({
     to: destinatario,
-    subject,
-    html,
+    subject: "Cancelación de tu cita médica",
+    html: tplWrapper(`
+      <h2 style="margin:0 0 8px 0;">Cita cancelada</h2>
+      <p>Se canceló tu cita.</p>
+      <p><strong>Fecha:</strong> ${fecha}<br/><strong>Hora:</strong> ${hora}</p>
+      <p>Si fue un error, agenda una nueva cita desde la app.</p>
+    `),
     text: `Cita cancelada. Fecha: ${fecha}. Hora: ${hora}.`,
     category: "citas-cancelacion",
   });
-
   console.log("📧 Cancelación enviada a", destinatario);
 }
 
-// === Endpoint de prueba ===
+// --- Endpoint test correo ---
 app.get("/test-correo", async (req, res) => {
   try {
-    const to =
-      process.env.TEST_TO ||
-      (process.env.EMAIL_FROM?.match(/<(.+)>/) || [])[1] ||
-      "pruebascalendar0@gmail.com";
-
+    const to = process.env.TEST_TO || (process.env.EMAIL_FROM?.match(/<(.+)>/) || [])[1] || "pruebascalendar0@gmail.com";
     await enviarMail({
       to,
       subject: "Prueba de envío (SendGrid + Render)",
@@ -236,280 +182,186 @@ app.get("/test-correo", async (req, res) => {
       text: "Si ves este correo, todo OK.",
       category: "test",
     });
-
     res.json({ ok: true, to });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
-// Exporta funciones
-module.exports = {
-  enviarCorreo,
-  enviarCorreoBienvenida,
-  enviarCorreoRecuperacion,
-  enviarCorreoActualizacion,
-  enviarCorreoCancelacion,
-};
-/*Correos*/
-
-/*Usuarios*/
-app.get("/usuarios",(req,res)=>{
-    const consulta = "SELECT * FROM usuarios"
-    conexion.query(consulta,(error,rpta) =>{
-        if(error) return console.log(error.message)
-
-            const obj = {}
-            if(rpta.length > 0){
-                obj.listaUsuarios = rpta
-                res.json(obj)
-            }else{
-                res.json({ mensaje: "no hay registros" })
-            }
-    })
-})
+// === Usuarios ===
+app.get("/usuarios", (req, res) => {
+  const consulta = `
+    SELECT id_usuario,usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_tipo
+    FROM usuarios
+    ORDER BY id_usuario ASC`;
+  conexion.query(consulta, (error, rpta) => {
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ listaUsuarios: rpta });
+  });
+});
 
 app.post("/usuario/agregar", (req, res) => {
-  const usuario = {
+  const u = {
     usuario_dni: req.body.usuario_dni,
     usuario_nombre: req.body.usuario_nombre,
     usuario_apellido: req.body.usuario_apellido,
     usuario_correo: req.body.usuario_correo,
-    usuario_contrasena: req.body.usuario_contrasena
+    usuario_contrasena: req.body.usuario_contrasena,
   };
 
-  // Validaciones
-  if (!usuario.usuario_dni || !/^\d{8}$/.test(usuario.usuario_dni)) {
-    return res.status(400).json({ mensaje: "El DNI debe tener exactamente 8 dígitos numéricos." });
-  }
+  if (!u.usuario_dni || !/^\d{8}$/.test(u.usuario_dni)) return res.status(400).json({ mensaje: "El DNI debe tener exactamente 8 dígitos numéricos." });
+  if (!u.usuario_nombre || !u.usuario_apellido) return res.status(400).json({ mensaje: "Nombre y apellido son obligatorios." });
+  if (!u.usuario_correo || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(u.usuario_correo)) return res.status(400).json({ mensaje: "Correo electrónico no válido." });
+  if (!u.usuario_contrasena || u.usuario_contrasena.length < 6) return res.status(400).json({ mensaje: "La contraseña debe tener al menos 6 caracteres." });
 
-  if (!usuario.usuario_nombre || !usuario.usuario_apellido) {
-    return res.status(400).json({ mensaje: "Nombre y apellido son obligatorios." });
-  }
+  const row = {
+    usuario_dni: u.usuario_dni,
+    usuario_nombre: u.usuario_nombre,
+    usuario_apellido: u.usuario_apellido,
+    usuario_correo: u.usuario_correo,
+    usuario_contrasena_hash: hashPassword(u.usuario_contrasena),
+    usuario_tipo: 1,
+  };
 
-  if (
-    !usuario.usuario_correo ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(usuario.usuario_correo)
-  ) {
-    return res.status(400).json({ mensaje: "Correo electrónico no válido." });
-  }
-
-  if (!usuario.usuario_contrasena || usuario.usuario_contrasena.length < 6) {
-    return res.status(400).json({ mensaje: "La contraseña debe tener al menos 6 caracteres." });
-  }
-
-  const consulta = "INSERT INTO usuarios SET ?";
-  conexion.query(consulta, usuario, (error) => {
+  const sql = "INSERT INTO usuarios SET ?";
+  conexion.query(sql, row, (error) => {
     if (error) {
+      console.error("❌ Error INSERT usuarios:", { code: error.code, errno: error.errno, sqlMessage: error.sqlMessage });
       if (error.code === "ER_DUP_ENTRY") {
-        if (error.sqlMessage.includes("usuario_dni")) {
-          return res.status(400).json({ mensaje: "DNI ya está registrado" });
-        } else if (error.sqlMessage.includes("usuario_correo")) {
-          return res.status(400).json({ mensaje: "El correo ya está registrado." });
-        }
-
-        return res.status(400).json({ mensaje: "Datos duplicados en campos únicos." });
+        if (error.sqlMessage?.includes("usuario_dni")) return res.status(400).json({ mensaje: "DNI ya está registrado" });
+        if (error.sqlMessage?.includes("usuario_correo")) return res.status(400).json({ mensaje: "El correo ya está registrado." });
+        return res.status(400).json({ mensaje: "Datos duplicados" });
       }
-
+      if (error.code === "ER_BAD_FIELD_ERROR") {
+        // indica que la columna no existe (revisa punto B)
+        return res.status(500).json({ mensaje: "Columna inválida en BD (verificar usuario_contrasena_hash)." });
+      }
       return res.status(500).json({ mensaje: "Error al registrar usuario." });
     }
 
-    const nombreCompleto = `${usuario.usuario_nombre} ${usuario.usuario_apellido}`;
-    enviarCorreoBienvenida(usuario.usuario_correo, nombreCompleto);
-
+    const nombreCompleto = `${row.usuario_nombre} ${row.usuario_apellido}`;
+    enviarCorreoBienvenida(row.usuario_correo, nombreCompleto).catch(() => {});
     return res.json({ mensaje: "Usuario registrado correctamente." });
   });
 });
 
 app.put("/usuario/actualizar/:id", (req, res) => {
-    const { id } = req.params;
-    const {
-        usuario_nombre,
-        usuario_apellido,
-        usuario_correo
-    } = req.body;
+  const { id } = req.params;
+  const { usuario_nombre, usuario_apellido, usuario_correo } = req.body;
+  if (!usuario_nombre || !usuario_apellido || !usuario_correo) return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
 
-    if (!usuario_nombre || !usuario_apellido || !usuario_correo) {
-        return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
-    }
+  const verificar = "SELECT 1 FROM usuarios WHERE usuario_correo = ? AND id_usuario != ?";
+  conexion.query(verificar, [usuario_correo, id], (err, rows) => {
+    if (err) return res.status(500).json({ mensaje: "Error al verificar correo" });
+    if (rows.length > 0) return res.status(409).json({ mensaje: "El correo ya está en uso por otro usuario" });
 
-    // Verificar si el correo ya está en uso por otro usuario
-    const verificarCorreo = "SELECT * FROM usuarios WHERE usuario_correo = ? AND id_usuario != ?";
-    conexion.query(verificarCorreo, [usuario_correo, id], (err, results) => {
-        if (err) {
-            console.error("Error al verificar correo:", err);
-            return res.status(500).json({ mensaje: "Error al verificar correo" });
-        }
-
-        if (results.length > 0) {
-            return res.status(409).json({ mensaje: "El correo ya está en uso por otro usuario" });
-        }
-
-        // Si el correo está libre, proceder con la actualización
-        const actualizarUsuario = `
-            UPDATE usuarios SET 
-            usuario_nombre = ?, 
-            usuario_apellido = ?, 
-            usuario_correo = ?
-            WHERE id_usuario = ?
-        `;
-
-        conexion.query(actualizarUsuario, [usuario_nombre, usuario_apellido, usuario_correo, id], (error, resultado) => {
-            if (error) {
-                console.error("Error al actualizar usuario:", error);
-                return res.status(500).json({ mensaje: "Error al actualizar usuario" });
-            }
-
-            res.status(200).json({ mensaje: "Usuario actualizado correctamente" });
-        });
+    const actualizar = "UPDATE usuarios SET usuario_nombre=?, usuario_apellido=?, usuario_correo=? WHERE id_usuario=?";
+    conexion.query(actualizar, [usuario_nombre, usuario_apellido, usuario_correo, id], (e2) => {
+      if (e2) return res.status(500).json({ mensaje: "Error al actualizar usuario" });
+      res.status(200).json({ mensaje: "Usuario actualizado correctamente" });
     });
+  });
 });
 
 app.post("/usuario/recuperar-correo", (req, res) => {
   const { usuario_dni, usuario_nombre, usuario_apellido } = req.body;
   const consulta = `
     SELECT usuario_correo FROM usuarios
-    WHERE usuario_dni = ? AND usuario_nombre = ? AND usuario_apellido = ?
-  `;
-  conexion.query(consulta, [usuario_dni, usuario_nombre, usuario_apellido], (error, resultados) => {
-    if (error) return res.status(500).json({ error: "Error interno del servidor" });
-    if (resultados.length === 0) return res.status(404).json({ mensaje: "Usuario no encontrado" });
-
-    res.json({ correo: resultados[0].usuario_correo });
+    WHERE usuario_dni = ? AND usuario_nombre = ? AND usuario_apellido = ?`;
+  conexion.query(consulta, [usuario_dni, usuario_nombre, usuario_apellido], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error interno del servidor" });
+    if (rows.length === 0) return res.status(404).json({ mensaje: "Usuario no encontrado" });
+    res.json({ correo: rows[0].usuario_correo });
   });
 });
 
-
+// En vez de "enviar la contraseña", generamos una temporal, la guardamos hasheada y la enviamos
 app.post("/usuario/recuperar-contrasena", (req, res) => {
   const { usuario_correo } = req.body;
+  const q = "SELECT id_usuario, usuario_nombre, usuario_apellido FROM usuarios WHERE usuario_correo = ?";
+  conexion.query(q, [usuario_correo], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error interno del servidor" });
+    if (rows.length === 0) return res.status(404).json({ mensaje: "Correo no registrado" });
 
-  const consulta = "SELECT usuario_nombre, usuario_apellido, usuario_contrasena FROM usuarios WHERE usuario_correo = ?";
-  conexion.query(consulta, [usuario_correo], (error, resultados) => {
-    if (error) {
-      console.error("Error consultando usuario:", error.message);
-      return res.status(500).json({ error: "Error interno del servidor" });
-    }
-
-    if (resultados.length === 0) {
-      return res.status(404).json({ mensaje: "Correo no registrado" });
-    }
-
-    const usuario = resultados[0];
-    const nombreCompleto = `${usuario.usuario_nombre} ${usuario.usuario_apellido}`;
-    enviarCorreoRecuperacion(usuario_correo, nombreCompleto, usuario.usuario_contrasena);
-    res.json({ mensaje: "Correo de recuperación enviado" });
+    const { id_usuario, usuario_nombre, usuario_apellido } = rows[0];
+    const temp = generarPasswordTemporal(10);
+    const hashed = hashPassword(temp);
+    conexion.query("UPDATE usuarios SET usuario_contrasena_hash=? WHERE id_usuario=?", [hashed, id_usuario], (e2) => {
+      if (e2) return res.status(500).json({ error: "No se pudo actualizar la contraseña" });
+      const nombre = `${usuario_nombre} ${usuario_apellido}`;
+      enviarCorreoRecuperacion(usuario_correo, nombre, temp).catch(() => {});
+      res.json({ mensaje: "Se envió una contraseña temporal a tu correo" });
+    });
   });
 });
 
+// Registrar usuario genérico (incluye médicos si usuario_tipo=2)
 app.post("/usuario/registrar", (req, res) => {
-    const {
-        usuario_nombre,
-        usuario_apellido,
-        usuario_correo,
-        usuario_dni,
-        usuario_contrasena,
-        usuario_tipo,
-        id_especialidad 
-    } = req.body;
-
-    if (!usuario_nombre || !usuario_apellido || !usuario_correo || !usuario_dni || !usuario_contrasena || usuario_tipo === undefined) {
-        return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
+  const { usuario_nombre, usuario_apellido, usuario_correo, usuario_dni, usuario_contrasena, usuario_tipo, id_especialidad } = req.body;
+  if (!usuario_nombre || !usuario_apellido || !usuario_correo || !usuario_dni || !usuario_contrasena || usuario_tipo === undefined) {
+    return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
+  }
+  const nuevo = {
+    usuario_nombre,
+    usuario_apellido,
+    usuario_correo,
+    usuario_dni,
+    usuario_contrasena_hash: hashPassword(usuario_contrasena),
+    usuario_tipo,
+  };
+  conexion.query("INSERT INTO usuarios SET ?", nuevo, (error, resultados) => {
+    if (error) {
+      if (error.code === "ER_DUP_ENTRY") {
+        if (error.sqlMessage.includes("usuario_dni")) return res.status(400).json({ mensaje: "DNI ya está registrado" });
+        if (error.sqlMessage.includes("usuario_correo")) return res.status(400).json({ mensaje: "El correo ya está registrado." });
+        return res.status(400).json({ mensaje: "Datos duplicados" });
+      }
+      return res.status(500).json({ mensaje: "Error al registrar usuario" });
     }
-
-    const nuevoUsuario = {
-        usuario_nombre,
-        usuario_apellido,
-        usuario_correo,
-        usuario_dni,
-        usuario_contrasena,
-        usuario_tipo
-    };
-
-    const query = "INSERT INTO usuarios SET ?";
-
-    conexion.query(query, nuevoUsuario, (error, resultados) => {
-        if (error) {
-            if (error.code === "ER_DUP_ENTRY") {
-                if (error.sqlMessage.includes("usuario_dni")) {
-                    return res.status(400).json({ mensaje: "DNI ya está registrado" });
-                } else if (error.sqlMessage.includes("usuario_correo")) {
-                    return res.status(400).json({ mensaje: "El correo ya está registrado." });
-                }
-                return res.status(400).json({ mensaje: "Datos duplicados en campos únicos." });
-            }
-
-            console.error("Error al registrar usuario:", error);
-            return res.status(500).json({ mensaje: "Error al registrar usuario" });
-        }
-
-        const id_usuario = resultados.insertId;
-
-        // Si es médico, insertamos en la tabla medicos
-        if (usuario_tipo === 2 && id_especialidad) {
-            const queryMedico = "INSERT INTO medicos (id_medico, id_especialidad) VALUES (?, ?)";
-            conexion.query(queryMedico, [id_usuario, id_especialidad], (errorMedico) => {
-                if (errorMedico) {
-                    console.error("Error al insertar en médicos:", errorMedico);
-                    return res.status(201).json({ mensaje: "Usuario registrado, pero no se pudo asignar la especialidad", id_usuario });
-                }
-                res.status(201).json({ mensaje: "Médico registrado correctamente", id_usuario });
-            });
-        } else {
-            res.status(201).json({ mensaje: "Usuario registrado correctamente", id_usuario });
-        }
-    });
+    const id_usuario = resultados.insertId;
+    if (usuario_tipo === 2 && id_especialidad) {
+      conexion.query("INSERT INTO medicos (id_medico, id_especialidad) VALUES (?, ?)", [id_usuario, id_especialidad], (e2) => {
+        if (e2) return res.status(201).json({ mensaje: "Usuario registrado, pero no se pudo asignar la especialidad", id_usuario });
+        res.status(201).json({ mensaje: "Médico registrado correctamente", id_usuario });
+      });
+    } else {
+      res.status(201).json({ mensaje: "Usuario registrado correctamente", id_usuario });
+    }
+  });
 });
 
 app.get("/usuario/:correo", (req, res) => {
-  const correo = decodeURIComponent(req.params.correo); // decodificar por si acaso
-  const consulta = "SELECT * FROM usuarios WHERE usuario_correo = ?";
-  conexion.query(consulta, [correo], (error, rpta) => {
-      if (error) return res.status(500).send(error.message);
-      if (rpta.length > 0) {
-          res.json(rpta[0]);
-      } else {
-          res.status(404).send({ mensaje: "no hay registros" });
-      }
+  const correo = decodeURIComponent(req.params.correo);
+  const consulta = `
+    SELECT id_usuario,usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_tipo
+    FROM usuarios WHERE usuario_correo = ?`;
+  conexion.query(consulta, [correo], (error, rows) => {
+    if (error) return res.status(500).send(error.message);
+    if (rows.length > 0) res.json(rows[0]);
+    else res.status(404).send({ mensaje: "no hay registros" });
   });
 });
 
-/*Usuarios*/
-
-/*Medicos*/
-app.get("/especialidades",(req,res)=>{
-    const consulta = "SELECT * FROM especialidades"
-    conexion.query(consulta,(error,rpta) =>{
-        if(error) return console.log(error.message)
-
-            const obj = {}
-            if(rpta.length > 0){
-                obj.listaEspecialidades = rpta
-                res.json(obj)
-            }else{
-              res.json({ mensaje: "no hay registros" })
-            }
-    })
-})
+// === Médicos / Especialidades / Horarios ===
+app.get("/especialidades", (req, res) => {
+  conexion.query("SELECT * FROM especialidades", (error, rpta) => {
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(rpta.length ? { listaEspecialidades: rpta } : { mensaje: "no hay registros" });
+  });
+});
 
 app.get("/horarios/:parametro", (req, res) => {
-  const valores = req.params.parametro.split("&");
-  const fecha = valores[0];
-  const especialidad = valores[1];
-
+  const [fecha, especialidad] = req.params.parametro.split("&");
   const consulta = `
-  SELECT h.*, 
-        TIME_FORMAT(h.horario_hora,'%H:%i') as horario_horas, 
-        u.usuario_nombre as medico_nombre, 
-        u.usuario_apellido as medico_apellido,
-        e.especialidad_nombre
+  SELECT h.*, TIME_FORMAT(h.horario_hora,'%H:%i') as horario_horas, 
+         u.usuario_nombre as medico_nombre, u.usuario_apellido as medico_apellido,
+         e.especialidad_nombre
   FROM horarios_medicos h
   INNER JOIN medicos m ON h.id_medico = m.id_medico
   INNER JOIN usuarios u ON m.id_medico = u.id_usuario
   INNER JOIN especialidades e ON h.id_especialidad = e.id_especialidad
   WHERE h.horario_fecha = ? AND h.id_especialidad = ? AND h.horario_estado = 0
-  ORDER BY h.horario_hora ASC
-  `;
-
+  ORDER BY h.horario_hora ASC`;
   conexion.query(consulta, [fecha, especialidad], (error, rpta) => {
     if (error) return res.status(500).json({ error: error.message });
     res.json({ listaHorarios: rpta });
@@ -519,48 +371,18 @@ app.get("/horarios/:parametro", (req, res) => {
 app.put("/horario/actualizar/:id_horario", (req, res) => {
   const { id_horario } = req.params;
   const { id_medico, fecha_nueva, hora_nueva, id_especialidad } = req.body;
+  if (!id_medico || !fecha_nueva || !hora_nueva || !id_especialidad) return res.status(400).json({ mensaje: "Datos incompletos para actualizar el horario" });
 
-  if (!id_medico || !fecha_nueva || !hora_nueva || !id_especialidad) {
-    return res.status(400).json({ mensaje: "Datos incompletos para actualizar el horario" });
-  }
+  const qOld = "SELECT horario_fecha, horario_hora FROM horarios_medicos WHERE id_horario = ?";
+  conexion.query(qOld, [id_horario], (err1, r1) => {
+    if (err1 || r1.length === 0) return res.status(500).json({ mensaje: "Error al obtener el horario original" });
+    const anterior = r1[0];
+    const liberar = "UPDATE horarios_medicos SET horario_estado = 0 WHERE horario_fecha = ? AND horario_hora = ? AND id_medico = ?";
+    conexion.query(liberar, [anterior.horario_fecha, anterior.horario_hora, id_medico], () => {});
 
-  // 1. Obtener el horario anterior
-  const queryHorarioAnterior = `
-    SELECT horario_fecha, horario_hora 
-    FROM horarios_medicos 
-    WHERE id_horario = ?
-  `;
-
-  conexion.query(queryHorarioAnterior, [id_horario], (err1, result1) => {
-    if (err1 || result1.length === 0) {
-      console.error("Error al obtener horario anterior:", err1);
-      return res.status(500).json({ mensaje: "Error al obtener el horario original" });
-    }
-
-    const horarioAnterior = result1[0];
-
-    // 2. Liberar horario anterior
-    const liberar = `
-      UPDATE horarios_medicos 
-      SET horario_estado = 0 
-      WHERE horario_fecha = ? AND horario_hora = ? AND id_medico = ?
-    `;
-    conexion.query(liberar, [horarioAnterior.horario_fecha, horarioAnterior.horario_hora, id_medico], (err2) => {
-      if (err2) console.warn("No se pudo liberar el horario anterior:", err2);
-    });
-
-    // 3. Actualizar con nuevo horario
-    const actualizar = `
-      UPDATE horarios_medicos 
-      SET horario_fecha = ?, horario_hora = ?, horario_estado = 1, id_especialidad = ?
-      WHERE id_horario = ?
-    `;
+    const actualizar = "UPDATE horarios_medicos SET horario_fecha=?, horario_hora=?, horario_estado=1, id_especialidad=? WHERE id_horario=?";
     conexion.query(actualizar, [fecha_nueva, hora_nueva, id_especialidad, id_horario], (err3) => {
-      if (err3) {
-        console.error("Error al actualizar el horario:", err3.sqlMessage);
-        return res.status(500).json({ mensaje: "Error al actualizar el horario" });
-      }
-
+      if (err3) return res.status(500).json({ mensaje: "Error al actualizar el horario" });
       res.json({ mensaje: "Horario actualizado correctamente" });
     });
   });
@@ -568,35 +390,18 @@ app.put("/horario/actualizar/:id_horario", (req, res) => {
 
 app.post("/horario/registrar", (req, res) => {
   const { id_medico, horario_horas, horario_fecha, id_especialidad } = req.body;
-
-  if (!id_medico || !horario_horas || !horario_fecha || !id_especialidad) {
-    return res.status(400).json({ error: "Faltan datos obligatorios" });
-  }
-  // Establecer siempre el horario como ocupado al registrarse
+  if (!id_medico || !horario_horas || !horario_fecha || !id_especialidad) return res.status(400).json({ error: "Faltan datos obligatorios" });
   const horario_estado = 0;
-
   const consulta = `
-    INSERT INTO horarios_medicos 
-      (id_medico, horario_hora, horario_fecha, horario_estado, id_especialidad)
-    VALUES (?, ?, ?, ?, ?)
-  `;
-
-  conexion.query(
-    consulta,
-    [id_medico, horario_horas, horario_fecha, horario_estado, id_especialidad],
-    (error, resultado) => {
-      if (error) {
-        if (error.code === "ER_DUP_ENTRY") {
-          return res.status(400).json({ error: "Ese horario ya fue registrado para este médico." });
-        }
-
-        console.error("Error al registrar horario:", error.message);
-        return res.status(500).json({ error: "Error interno al registrar el horario" });
-      }
-
-      res.json({ mensaje: "Horario registrado correctamente", id_horario: resultado.insertId });
+    INSERT INTO horarios_medicos (id_medico, horario_hora, horario_fecha, horario_estado, id_especialidad)
+    VALUES (?, ?, ?, ?, ?)`;
+  conexion.query(consulta, [id_medico, horario_horas, horario_fecha, horario_estado, id_especialidad], (error, r) => {
+    if (error) {
+      if (error.code === "ER_DUP_ENTRY") return res.status(400).json({ error: "Ese horario ya fue registrado para este médico." });
+      return res.status(500).json({ error: "Error interno al registrar el horario" });
     }
-  );
+    res.json({ mensaje: "Horario registrado correctamente", id_horario: r.insertId });
+  });
 });
 
 app.get("/medico/:id_medico/especialidades", (req, res) => {
@@ -605,9 +410,7 @@ app.get("/medico/:id_medico/especialidades", (req, res) => {
     SELECT e.id_especialidad, e.especialidad_nombre
     FROM medicos m
     INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
-    WHERE m.id_medico = ?
-  `;
-
+    WHERE m.id_medico = ?`;
   conexion.query(consulta, [id_medico], (err, rpta) => {
     if (err) return res.status(500).json({ error: "Error al obtener especialidades" });
     res.json({ listaEspecialidades: rpta });
@@ -616,122 +419,49 @@ app.get("/medico/:id_medico/especialidades", (req, res) => {
 
 app.get("/horarios/disponibles/:id_medico/:fecha/:id_especialidad", (req, res) => {
   const { id_medico, fecha, id_especialidad } = req.params;
-
-  console.log(`[INFO] Consultando horarios disponibles para médico ${id_medico}, fecha ${fecha}, especialidad ${id_especialidad}`);
-
-  const todasLasHoras = Array.from({ length: 9 }, (_, i) => `${(8 + i).toString().padStart(2, '0')}:00`);
-
-  const consulta = `
-    SELECT TIME_FORMAT(horario_hora, '%H:%i') AS hora
-    FROM horarios_medicos
-    WHERE id_medico = ? AND horario_fecha = ? AND id_especialidad = ?
-  `;
-
-  conexion.query(consulta, [id_medico, fecha, id_especialidad], (error, resultados) => {
-    if (error) {
-      console.error(`[ERROR] Consulta fallida: ${error.message}`);
-      return res.status(500).json({ error: "Error al consultar horarios" });
-    }
-
+  const todasLasHoras = Array.from({ length: 9 }, (_, i) => `${(8 + i).toString().padStart(2, "0")}:00`);
+  const q = `SELECT TIME_FORMAT(horario_hora, '%H:%i') AS hora
+             FROM horarios_medicos
+             WHERE id_medico=? AND horario_fecha=? AND id_especialidad=?`;
+  conexion.query(q, [id_medico, fecha, id_especialidad], (error, resultados) => {
+    if (error) return res.status(500).json({ error: "Error al consultar horarios" });
     const horasOcupadas = resultados.map(r => r.hora);
-    const horasDisponibles = todasLasHoras.filter(hora => !horasOcupadas.includes(hora));
-
-    console.log("[INFO] Horas disponibles:", horasDisponibles);
-    
+    const horasDisponibles = todasLasHoras.filter(h => !horasOcupadas.includes(h));
     res.json({ horariosDisponibles: horasDisponibles });
   });
 });
 
 app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", (req, res) => {
   const { id_medico, fecha, id_especialidad } = req.params;
-
-  console.log("[DEBUG] Obteniendo horarios registrados:", { id_medico, fecha, id_especialidad });
-
   const sql = `
     SELECT horario_hora 
     FROM horarios_medicos 
-    WHERE id_medico = ? 
-      AND horario_fecha = ? 
-      AND id_especialidad = ?
-      AND horario_estado = 0
-    ORDER BY horario_hora ASC
-  `;
-
+    WHERE id_medico=? AND horario_fecha=? AND id_especialidad=? AND horario_estado=0
+    ORDER BY horario_hora ASC`;
   conexion.query(sql, [id_medico, fecha, id_especialidad], (err, results) => {
-    if (err) {
-      console.error("[ERROR SQL]", err);
-      return res.status(500).json({ error: "Error interno del servidor" });
-    }
-
+    if (err) return res.status(500).json({ error: "Error interno del servidor" });
     const horarios = results.map(row => row.horario_hora);
     res.json({ horarios });
   });
 });
-/*Medicos*/
 
-/*Citas*/
-
+// === Citas ===
 app.post("/cita/agregar", (req, res) => {
-  console.log("Datos recibidos:", req.body);
-
   const { id_usuario, id_medico, cita_fecha, cita_hora } = req.body;
-
-  // Calcular número de orden como cantidad de citas previas + 1
   const consultaOrden = "SELECT COUNT(*) AS total FROM citas WHERE id_usuario = ?";
   conexion.query(consultaOrden, [id_usuario], (error, results) => {
-    if (error) {
-      console.error("Error calculando número de orden:", error.message);
-      return res.status(500).json({ error: "Error interno al calcular el número de orden" });
-    }
-
+    if (error) return res.status(500).json({ error: "Error al calcular número de orden" });
     const numero_orden = results[0].total + 1;
-
-    const cita = {
-      id_usuario,
-      id_medico,
-      cita_fecha,
-      cita_hora,
-      numero_orden,
-    };
-
-    const consultaInsert = "INSERT INTO citas SET ?";
-    conexion.query(consultaInsert, cita, (errorInsert) => {
-      if (errorInsert) {
-        console.error("Error insertando cita:", errorInsert.message);
-        return res.status(500).json({ error: "Error al registrar la cita" });
-      }
-
-      const marcarHorario = `
-        UPDATE horarios_medicos SET horario_estado = 1 
-        WHERE horario_fecha = ? AND horario_hora = ? AND id_medico = ?
-      `;
-      conexion.query(marcarHorario, [cita_fecha, cita_hora, id_medico], (errUpdate) => {
-        if (errUpdate) {
-          console.warn(" No se pudo marcar el horario como ocupado:", errUpdate.message);
-        }
-      });
-
-      const consultaCorreo = "SELECT usuario_correo FROM usuarios WHERE id_usuario = ?";
-      conexion.query(consultaCorreo, [id_usuario], (errorCorreo, resultsCorreo) => {
-        if (errorCorreo) {
-          console.error("Error buscando correo:", errorCorreo.message);
-          return res.status(500).json({ error: "Error interno al obtener el correo" });
-        }
-
-        if (resultsCorreo.length === 0) {
-          console.warn("No se encontró el correo para el usuario:", id_usuario);
-          return res.status(404).json({ error: "Usuario no encontrado" });
-        }
-
-        const destinatario = resultsCorreo[0].usuario_correo;
-        console.log("Correo destinatario encontrado en BD:", destinatario);
-
-        enviarCorreo(destinatario, cita_fecha, cita_hora);
-
-        res.json({
-          mensaje: "Cita registrada correctamente",
-          numero_orden
-        });
+    const cita = { id_usuario, id_medico, cita_fecha, cita_hora, numero_orden };
+    conexion.query("INSERT INTO citas SET ?", cita, (e2) => {
+      if (e2) return res.status(500).json({ error: "Error al registrar la cita" });
+      const ocupar = "UPDATE horarios_medicos SET horario_estado=1 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?";
+      conexion.query(ocupar, [cita_fecha, cita_hora, id_medico], () => {});
+      conexion.query("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], (e3, r3) => {
+        if (e3 || r3.length === 0) return res.status(404).json({ error: "Usuario no encontrado" });
+        const destinatario = r3[0].usuario_correo;
+        enviarCorreo(destinatario, cita_fecha, cita_hora).catch(() => {});
+        res.json({ mensaje: "Cita registrada correctamente", numero_orden });
       });
     });
   });
@@ -740,168 +470,79 @@ app.post("/cita/agregar", (req, res) => {
 app.put("/cita/actualizar/:id", (req, res) => {
   const { id } = req.params;
   const { id_usuario, id_medico, cita_fecha, cita_hora, cita_estado } = req.body;
+  if (!id_usuario || !id_medico || !cita_fecha || !cita_hora) return res.status(400).json({ mensaje: "Datos incompletos para actualizar la cita" });
 
-  if (!id_usuario || !id_medico || !cita_fecha || !cita_hora) {
-    return res.status(400).json({ mensaje: "Datos incompletos para actualizar la cita" });
-  }
+  conexion.query("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], (e0, rows) => {
+    if (e0 || rows.length === 0) return res.status(500).json({ mensaje: "No se pudo obtener el correo del usuario" });
+    const usuario_correo = rows[0].usuario_correo;
 
-  const queryCorreo = "SELECT usuario_correo FROM usuarios WHERE id_usuario = ?";
-  conexion.query(queryCorreo, [id_usuario], (errCorreo, results) => {
-    if (errCorreo || results.length === 0) {
-      console.error("Error al obtener correo:", errCorreo);
-      return res.status(500).json({ mensaje: "No se pudo obtener el correo del usuario" });
-    }
-
-    const usuario_correo = results[0].usuario_correo;
-
-    // 1. Obtener el horario anterior
-    const queryHorarioAnterior = `
-      SELECT cita_fecha, cita_hora FROM citas WHERE id_cita = ?
-    `;
-    conexion.query(queryHorarioAnterior, [id], (err1, result1) => {
-      if (err1) {
-        console.error("Error al obtener el horario anterior:", err1);
-        return res.status(500).json({ mensaje: "Error interno al obtener horario anterior" });
-      }
-
-      const horarioAnterior = result1[0];
-
-      // 2. Liberar horario anterior
-      const liberar = `
-        UPDATE horarios_medicos SET horario_estado = 0 
-        WHERE horario_fecha = ? AND horario_hora = ? AND id_medico = ?
-      `;
-      conexion.query(liberar, [horarioAnterior.cita_fecha, horarioAnterior.cita_hora, id_medico], (err2) => {
-        if (err2) console.warn("No se pudo liberar el horario anterior:", err2);
-      });
-
-      // 3. Actualizar la cita
-      const sql = `
-        UPDATE citas SET 
-          id_usuario = ?, 
-          id_medico = ?, 
-          cita_fecha = ?, 
-          cita_hora = ?, 
-          cita_estado = ?
-        WHERE id_cita = ?
-      `;
-      conexion.query(sql, [id_usuario, id_medico, cita_fecha, cita_hora, cita_estado, id], (err3) => {
-        if (err3) {
-          console.error("Error al actualizar la cita:", err3.sqlMessage);
-          return res.status(500).json({ mensaje: "Error al actualizar la cita" });
-        }
-
-        // 4. Marcar nuevo horario como ocupado
-        const ocupar = `
-          UPDATE horarios_medicos SET horario_estado = 1 
-          WHERE horario_fecha = ? AND horario_hora = ? AND id_medico = ?
-        `;
-        conexion.query(ocupar, [cita_fecha, cita_hora, id_medico], (err4) => {
-          if (err4) {
-            console.warn("⚠️ No se pudo marcar el nuevo horario como ocupado:", err4);
-          }
-        });
-
-        // 5. Enviar correo
-        enviarCorreoActualizacion(usuario_correo, cita_fecha, cita_hora);
-
+    conexion.query("SELECT cita_fecha, cita_hora FROM citas WHERE id_cita=?", [id], (e1, r1) => {
+      if (e1 || r1.length === 0) return res.status(500).json({ mensaje: "Error al obtener horario anterior" });
+      const anterior = r1[0];
+      conexion.query("UPDATE horarios_medicos SET horario_estado=0 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?", [anterior.cita_fecha, anterior.cita_hora, id_medico], () => {});
+      const up = "UPDATE citas SET id_usuario=?, id_medico=?, cita_fecha=?, cita_hora=?, cita_estado=? WHERE id_cita=?";
+      conexion.query(up, [id_usuario, id_medico, cita_fecha, cita_hora, cita_estado, id], (e3) => {
+        if (e3) return res.status(500).json({ mensaje: "Error al actualizar la cita" });
+        conexion.query("UPDATE horarios_medicos SET horario_estado=1 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?", [cita_fecha, cita_hora, id_medico], () => {});
+        enviarCorreoActualizacion(usuario_correo, cita_fecha, cita_hora).catch(() => {});
         res.status(200).json({ mensaje: "Cita actualizada correctamente" });
       });
     });
   });
 });
 
-app.put("/horario/editar/:id_medico/:fecha/:hora", (req, res) => {
-  const { id_medico, fecha, hora } = req.params;
-  const { accion, nuevaHora, id_especialidad } = req.body;
-
-  if (!accion || !id_especialidad) {
-    return res.status(400).json({ mensaje: "Datos incompletos" });
-  }
-
-  if (accion === "eliminar") {
-    const eliminar = `
-      DELETE FROM horarios_medicos 
-      WHERE id_medico = ? AND horario_fecha = ? AND horario_hora = ? AND id_especialidad = ?
-    `;
-    conexion.query(eliminar, [id_medico, fecha, hora, id_especialidad], (err) => {
-      if (err) return res.status(500).json({ mensaje: "Error al eliminar horario" });
-      return res.json({ mensaje: "Horario eliminado correctamente" });
+app.put("/cita/anular/:id_cita", (req, res) => {
+  const { id_cita } = req.params;
+  const qDatos = "SELECT cita_fecha, cita_hora, id_medico FROM citas WHERE id_cita = ?";
+  conexion.query(qDatos, [id_cita], (e1, r1) => {
+    if (e1 || r1.length === 0) return res.status(404).json({ mensaje: "Cita no encontrada" });
+    const { cita_fecha, cita_hora, id_medico } = r1[0];
+    conexion.query("UPDATE citas SET cita_estado=0 WHERE id_cita=?", [id_cita], (e2) => {
+      if (e2) return res.status(500).json({ error: "Error al cancelar la cita" });
+      conexion.query("UPDATE horarios_medicos SET horario_estado=0 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?", [cita_fecha, cita_hora, id_medico], (e3) => {
+        if (e3) return res.status(500).json({ error: "Error al liberar el horario" });
+        res.json({ mensaje: "Cita cancelada y horario liberado correctamente" });
+      });
     });
-  } else if (accion === "actualizar") {
-    const actualizar = `
-      UPDATE horarios_medicos SET horario_hora = ?, horario_estado = 0
-      WHERE id_medico = ? AND horario_fecha = ? AND horario_hora = ? AND id_especialidad = ?
-    `;
-    conexion.query(actualizar, [nuevaHora, id_medico, fecha, hora, id_especialidad], (err) => {
-      if (err) return res.status(500).json({ mensaje: "Error al actualizar horario" });
-      return res.json({ mensaje: "Horario actualizado correctamente" });
-    });
-  } else {
-    res.status(400).json({ mensaje: "Acción no reconocida" });
-  }
+  });
 });
 
-app.get("/horarios/:fecha/:id_especialidad", (req, res) => {
-  const { fecha, id_especialidad } = req.params;
-  const sql = `
-    SELECT * FROM horarios_medicos 
-    WHERE horario_fecha = ? AND id_especialidad = ? AND horario_estado = 0
-  `;
+app.put("/cita/anular/:id_usuario/:numero_orden", (req, res) => {
+  const { id_usuario, numero_orden } = req.params;
+  const q = `
+    SELECT id_cita, cita_fecha, cita_hora, id_medico 
+    FROM citas 
+    WHERE id_usuario=? AND numero_orden=? AND cita_estado=1`;
+  conexion.query(q, [id_usuario, numero_orden], (e1, r1) => {
+    if (e1) return res.status(500).json({ error: "Error al buscar la cita" });
+    if (r1.length === 0) return res.status(404).json({ mensaje: "Cita no encontrada" });
 
-  conexion.query(sql, [fecha, id_especialidad], (err, rows) => {
-    if (err) {
-      console.error("Error al obtener horarios:", err);
-      return res.status(500).json({ mensaje: "Error al obtener horarios" });
-    }
-
-    res.status(200).json({ listaHorarios: rows });
+    const { id_cita, cita_fecha, cita_hora, id_medico } = r1[0];
+    conexion.query("UPDATE citas SET cita_estado=0 WHERE id_cita=?", [id_cita], (e2) => {
+      if (e2) return res.status(500).json({ error: "Error al cancelar la cita" });
+      const liberar = "UPDATE horarios_medicos SET horario_estado=0 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?";
+      conexion.query(liberar, [cita_fecha, cita_hora, id_medico], (e3) => {
+        if (e3) return res.status(500).json({ error: "Error al liberar el horario" });
+        conexion.query("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], (e4, r4) => {
+          if (!e4 && r4.length) enviarCorreoCancelacion(r4[0].usuario_correo, cita_fecha, cita_hora).catch(() => {});
+          res.json({ mensaje: "Cita cancelada exitosamente" });
+        });
+      });
+    });
   });
 });
 
 app.get("/citas/por-dia", (req, res) => {
-  console.log("SE EJECUTÓ EL ENDPOINT /citas/por-dia");
-
   const consulta = `
-    SELECT 
-      cita_fecha AS fecha, 
-      COUNT(*) AS cantidad
+    SELECT cita_fecha AS fecha, COUNT(*) AS cantidad
     FROM citas
     WHERE cita_estado = 1
     GROUP BY cita_fecha
-    ORDER BY cita_fecha ASC
-  `;
-
+    ORDER BY cita_fecha ASC`;
   conexion.query(consulta, (error, resultados) => {
-    if (error) {
-      console.error("ERROR EN CONSULTA:", error.message);
-      return res.status(500).json({ error: "Error en la base de datos" });
-    }
-
-    console.log("RESULTADOS:", resultados);
-
-    const datos = resultados.map(row => ({
-      fecha: row.fecha.toISOString().slice(0, 10),
-      cantidad: row.cantidad
-    }));
-
-    console.log("DATOS FORMATEADOS:", datos);
-
+    if (error) return res.status(500).json({ error: "Error en la base de datos" });
+    const datos = resultados.map(row => ({ fecha: row.fecha.toISOString().slice(0, 10), cantidad: row.cantidad }));
     res.json({ listaCitas: datos });
-  });
-});
-
-app.put("/cita/estado/:id_cita", (req, res) => {
-  const { id_cita } = req.params;
-  const { nuevo_estado } = req.body;
-
-  const sql = "UPDATE citas SET cita_estado = ? WHERE id_cita = ?";
-  conexion.query(sql, [nuevo_estado, id_cita], (err) => {
-    if (err) {
-      console.error("Error al actualizar estado:", err);
-      return res.status(500).json({ mensaje: "Error al actualizar estado" });
-    }
-    res.json({ mensaje: "Estado actualizado correctamente" });
   });
 });
 
@@ -920,20 +561,11 @@ app.get("/citas/:usuario", (req, res) => {
     INNER JOIN usuarios u ON m.id_medico = u.id_usuario
     INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
     WHERE c.id_usuario = ?
-    ORDER BY c.id_cita ASC
-  `;
-
+    ORDER BY c.id_cita ASC`;
   conexion.query(consulta, [usuario], (error, rpta) => {
-    if (error) return console.log(error.message);
-    const obj = {};
-    if (rpta.length > 0) {
-      const citasNumeradas = rpta.map((cita, index) => ({ ...cita, numero_orden: index + 1 }));
-      obj.listaCitas = citasNumeradas;
-      res.json(obj);
-    } else {
-      obj.listaCitas = [];
-      res.json(obj);
-    }
+    if (error) return res.status(500).json({ error: error.message });
+    const lista = rpta.map((cita, idx) => ({ ...cita, numero_orden: idx + 1 }));
+    res.json({ listaCitas: lista });
   });
 });
 
@@ -951,9 +583,7 @@ app.get("/citamedica/:id_cita", (req, res) => {
     INNER JOIN medicos m ON cit.id_medico = m.id_medico
     INNER JOIN usuarios med ON m.id_medico = med.id_usuario
     INNER JOIN especialidades esp ON esp.id_especialidad = m.id_especialidad
-    WHERE cit.id_cita = ?
-  `;
-
+    WHERE cit.id_cita = ?`;
   conexion.query(consulta, [id_cita], (err, results) => {
     if (err) return res.status(500).json({ error: "Error en la base de datos" });
     if (results.length === 0) return res.status(404).json({ mensaje: "Cita no encontrada" });
@@ -963,8 +593,6 @@ app.get("/citamedica/:id_cita", (req, res) => {
 
 app.get("/cita/usuario/:id_usuario/orden/:numero_orden", (req, res) => {
   const { id_usuario, numero_orden } = req.params;
-  console.log('Buscando cita con id_usuario:', id_usuario, 'y numero_orden:', numero_orden);
-
   const consulta = `
     SELECT 
       cit.id_cita AS IdCita,
@@ -983,144 +611,11 @@ app.get("/cita/usuario/:id_usuario/orden/:numero_orden", (req, res) => {
     INNER JOIN medicos m ON m.id_medico = cit.id_medico
     INNER JOIN usuarios mu ON m.id_medico = mu.id_usuario
     INNER JOIN especialidades esp ON esp.id_especialidad = m.id_especialidad
-    WHERE cit.id_usuario = ? AND cit.numero_orden = ?
-  `;
-
+    WHERE cit.id_usuario = ? AND cit.numero_orden = ?`;
   conexion.query(consulta, [id_usuario, numero_orden], (err, results) => {
-    if (err) {
-      console.error("Error en la consulta:", err);
-      return res.status(500).json({ error: "Error en la base de datos" });
-    }
-
-    if (results.length === 0) {
-      return res.status(404).json({ mensaje: "Cita no encontrada" });
-    }
-
+    if (err) return res.status(500).json({ error: "Error en la base de datos" });
+    if (results.length === 0) return res.status(404).json({ mensaje: "Cita no encontrada" });
     res.json(results[0]);
-  });
-});
-
-app.get("/citas/medico/:id_medico", (req, res) => {
-  const { id_medico } = req.params;
-  const consulta = `
-    SELECT c.id_cita, c.id_usuario,
-           us.usuario_nombre AS paciente_nombre, us.usuario_apellido AS paciente_apellido,
-           DATE_FORMAT(c.cita_fecha, '%d/%m/%Y') AS cita_fecha,
-           TIME_FORMAT(c.cita_hora, '%H:%i') AS cita_hora,
-           u.usuario_nombre AS medico_nombre, u.usuario_apellido AS medico_apellido,
-           e.id_especialidad, e.especialidad_nombre,
-           c.cita_estado
-    FROM citas c
-    INNER JOIN usuarios us ON c.id_usuario = us.id_usuario
-    INNER JOIN medicos m ON c.id_medico = m.id_medico
-    INNER JOIN usuarios u ON m.id_medico = u.id_usuario
-    INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
-    WHERE c.id_medico = ?
-    ORDER BY c.id_cita ASC
-  `;
-
-  conexion.query(consulta, [id_medico], (error, rpta) => {
-    if (error) return res.status(500).json({ error: error.message });
-
-    // 🔢 Agregar número de atención secuencial
-    const listaNumerada = rpta.map((cita, index) => ({
-      ...cita,
-      numero_orden: index + 1
-    }));
-
-    res.json({ listaCitas: listaNumerada });
-  });
-});
-
-app.put("/cita/anular/:id_cita", (req, res) => {
-  const { id_cita } = req.params;
-  console.log('id_cita recibido:', id_cita);
-
-  // 1. Obtener datos de la cita
-  const consultaDatosCita = "SELECT cita_fecha, cita_hora, id_medico FROM citas WHERE id_cita = ?";
-  conexion.query(consultaDatosCita, [id_cita], (error, resultados) => {
-      if (error) {
-          console.error(error.message);
-          return res.status(500).json({ error: "Error al obtener los datos de la cita" });
-      }
-
-      if (resultados.length === 0) {
-          return res.status(404).json({ mensaje: "Cita no encontrada" });
-      }
-
-      const { cita_fecha, cita_hora, id_medico } = resultados[0];
-
-      // 2. Cancelar la cita
-      const consultaCancelar = "UPDATE citas SET cita_estado = 0 WHERE id_cita = ?";
-      conexion.query(consultaCancelar, [id_cita], (error2) => {
-          if (error2) {
-              console.error(error2.message);
-              return res.status(500).json({ error: "Error al cancelar la cita" });
-          }
-
-          // 3. Liberar el horario
-          const consultaLiberarHorario = `
-              UPDATE horarios_medicos 
-              SET horario_estado = 0 
-              WHERE horario_fecha = ? AND horario_hora = ? AND id_medico = ?
-          `;
-
-          conexion.query(consultaLiberarHorario, [cita_fecha, cita_hora, id_medico], (error3) => {
-              if (error3) {
-                  console.error(error3.message);
-                  return res.status(500).json({ error: "Error al liberar el horario" });
-              }
-
-              res.json({ mensaje: "Cita cancelada y horario liberado correctamente" });
-          });
-      });
-  });
-});
-
-app.put("/cita/anular/:id_usuario/:numero_orden", (req, res) => {
-  const { id_usuario, numero_orden } = req.params;
-
-  const consultaBuscarCita = `
-    SELECT id_cita, cita_fecha, cita_hora, id_medico 
-    FROM citas 
-    WHERE id_usuario = ? AND numero_orden = ? AND cita_estado = 1
-  `;
-
-  conexion.query(consultaBuscarCita, [id_usuario, numero_orden], (err, resultados) => {
-    if (err) return res.status(500).json({ error: "Error al buscar la cita" });
-
-    if (resultados.length === 0) {
-      return res.status(404).json({ mensaje: "Cita no encontrada" });
-    }
-
-    const { id_cita, cita_fecha, cita_hora, id_medico } = resultados[0];
-
-    const consultaCancelar = "UPDATE citas SET cita_estado = 0 WHERE id_cita = ?";
-    conexion.query(consultaCancelar, [id_cita], (err2) => {
-      if (err2) return res.status(500).json({ error: "Error al cancelar la cita" });
-
-      const consultaLiberarHorario = `
-        UPDATE horarios_medicos
-        SET horario_estado = 0
-        WHERE horario_fecha = ? AND horario_hora = ? AND id_medico = ?
-      `;
-
-      conexion.query(consultaLiberarHorario, [cita_fecha, cita_hora, id_medico], (err3) => {
-        if (err3) return res.status(500).json({ error: "Error al liberar el horario" });
-
-        const consultaCorreo = "SELECT usuario_correo FROM usuarios WHERE id_usuario = ?";
-        conexion.query(consultaCorreo, [id_usuario], (err4, rpta) => {
-          if (err4 || rpta.length === 0) {
-            console.warn("⚠️ No se pudo obtener el correo del usuario:", err4);
-          } else {
-            const destinatario = rpta[0].usuario_correo;
-            enviarCorreoCancelacion(destinatario, cita_fecha, cita_hora);
-          }
-
-          res.json({ mensaje: "Cita cancelada exitosamente" });
-        });
-      });
-    });
   });
 });
 
@@ -1142,69 +637,47 @@ app.get("/citas", (req, res) => {
     INNER JOIN medicos m ON c.id_medico = m.id_medico
     INNER JOIN usuarios mu ON m.id_medico = mu.id_usuario
     INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
-    ORDER BY u.usuario_nombre ASC, numero_cita ASC;
-  `;
-
+    ORDER BY u.usuario_nombre ASC, numero_cita ASC`;
   conexion.query(consulta, (error, rpta) => {
-    if (error) {
-      console.error("Error al obtener citas:", error.message);
-      return res.status(500).json({ error: "Error al obtener las citas" });
-    }
-
-    if (rpta.length > 0) {
-      res.json({ listaCitas: rpta });
-    } else {
-      res.json({ listaCitas: [] });
-    }
+    if (error) return res.status(500).json({ error: "Error al obtener las citas" });
+    res.json({ listaCitas: rpta.length ? rpta : [] });
   });
 });
 
-app.get("/medicos",(req,res)=>{
-    const consulta = "SELECT * FROM medicos"
-    conexion.query(consulta,(error,rpta) =>{
-        if(error) return console.log(error.message)
-
-            const obj = {}
-            if(rpta.length > 0){
-                obj.listaCitas = rpta
-                res.json(obj)
-            }else{
-              res.json({ mensaje: "no hay registros" })
-            }
-    })
+// Listado simple de medicos (tabla cruda)
+app.get("/medicos", (req, res) => {
+  conexion.query("SELECT * FROM medicos", (error, rpta) => {
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(rpta.length ? { listaCitas: rpta } : { mensaje: "no hay registros" });
+  });
 });
 
+// Especialidades CRUD básico
 app.post("/especialidad/agregar", (req, res) => {
   const { especialidad_nombre } = req.body;
-
-  if (!especialidad_nombre) {
-    return res.status(400).json({ error: "Nombre requerido" });
-  }
-
-  const consulta = "INSERT INTO especialidades (especialidad_nombre) VALUES (?)";
-  conexion.query(consulta, [especialidad_nombre], (err, resultado) => {
-    if (err) {
-      console.error("Error al insertar especialidad:", err.message);
-      return res.status(500).json({ error: "Error al guardar especialidad" });
-    }
+  if (!especialidad_nombre) return res.status(400).json({ error: "Nombre requerido" });
+  conexion.query("INSERT INTO especialidades (especialidad_nombre) VALUES (?)", [especialidad_nombre], (err) => {
+    if (err) return res.status(500).json({ error: "Error al guardar especialidad" });
     res.status(201).json("Especialidad registrada");
   });
 });
-
 app.put("/especialidad/actualizar/:id", (req, res) => {
   const { id } = req.params;
   const { especialidad_nombre } = req.body;
-
-  if (!especialidad_nombre) {
-    return res.status(400).json({ mensaje: "Nombre requerido" });
-  }
-
-  const sql = "UPDATE especialidades SET especialidad_nombre = ? WHERE id_especialidad = ?";
-  conexion.query(sql, [especialidad_nombre, id], (err) => {
-    if (err) {
-      console.error("Error al actualizar especialidad:", err.message);
-      return res.status(500).json({ error: "Error al actualizar especialidad" });
-    }
+  if (!especialidad_nombre) return res.status(400).json({ mensaje: "Nombre requerido" });
+  conexion.query("UPDATE especialidades SET especialidad_nombre=? WHERE id_especialidad=?", [especialidad_nombre, id], (err) => {
+    if (err) return res.status(500).json({ error: "Error al actualizar especialidad" });
     res.json({ mensaje: "Especialidad actualizada correctamente" });
   });
 });
+
+// Opcional: exportar helpers si lo usas en otros módulos
+module.exports = {
+  enviarCorreo,
+  enviarCorreoBienvenida,
+  enviarCorreoRecuperacion,
+  enviarCorreoActualizacion,
+  enviarCorreoCancelacion,
+  hashPassword,
+  verifyPassword,
+};
