@@ -1,38 +1,17 @@
 require("dotenv").config();
 
-const express = require("express")
+const express = require("express");
+const mysql = require("mysql2");
 
-const nodemailer = require("nodemailer");
-const mysql = require("mysql2")
-const bodyParser = require("body-parser")
-
-const app = express()
+const app = express();
 const PUERTO = process.env.PORT || 3000;
+app.use(express.json()); // body-parser no necesario
 
-app.use(bodyParser.json())
+const sg = require("@sendgrid/mail");
+sg.setApiKey(process.env.SENDGRID_API_KEY);
 
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,           // SSL directo
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD,
-  },
-  family: 4,
-  connectionTimeout: 30000,
-  socketTimeout: 30000,
-  tls: { minVersion: "TLSv1.2", rejectUnauthorized: true },
-  logger: true,
-  debug: true,
-});
-
-transporter.verify()
-  .then(() => console.log("✅ SMTP listo para enviar"))
-  .catch(err => console.error("❌ SMTP error:", err));
-
-function correoFrom(nombre = "Clínica Salud Total") {
-  return `"${nombre}" <${process.env.EMAIL_USER}>`;
+function fromName() {
+  return process.env.EMAIL_FROM || "Clínica Salud Total <pruebascalendar0@gmail.com>";
 }
 
 const conexion = mysql.createConnection({
@@ -57,162 +36,100 @@ app.listen(PUERTO,()=>{
 });
 
 /*Correos*/
-function enviarCorreo(destinatario, fecha, hora) {
-  const mailOptions = {
-    from: correoFrom(),
+async function enviarCorreo(destinatario, fecha, hora) {
+  await sg.send({
+    from: fromName(),
     to: destinatario,
     subject: "Confirmación de tu cita médica",
     html: `
-      <h2 style="color: #2e86de;">¡Cita médica confirmada!</h2>
+      <h2 style="color:#2e86de;">¡Cita médica confirmada!</h2>
       <p>Tu cita ha sido registrada con éxito.</p>
       <p><strong>Fecha:</strong> ${fecha}</p>
       <p><strong>Hora:</strong> ${hora}</p>
-      <p>Gracias por confiar en nuestra clínica.</p>
-      <hr/>
-      <footer style="font-size: 0.9em; color: #888; margin-top: 20px;">
-        <p><strong>Clínica Salud Total</strong> – Sistema de Citas</p>
-        <p>Este es un mensaje automático, no respondas a este correo.</p>
-      </footer>`
-  };
-
-  transporter.sendMail(mailOptions, (error, info) => {
-    if (error) {
-      console.log("Error al enviar correo:", error);
-    } else {
-      console.log("Correo enviado:", info.response);
-    }
+      <hr/><small>Mensaje automático, no responder.</small>
+    `,
   });
+  console.log("📧 Confirmación enviada a", destinatario);
 }
 
-function enviarCorreoBienvenida(destinatario, nombre) {
-  const mailOptions = {
-    from: correoFrom(),
+async function enviarCorreoBienvenida(destinatario, nombre) {
+  await sg.send({
+    from: fromName(),
     to: destinatario,
     subject: "Bienvenido a Clínica Salud Total",
     html: `
-      <h2 style="color: #2e86de;">¡Bienvenido, ${nombre}!</h2>
+      <h2 style="color:#2e86de;">¡Bienvenido, ${nombre}!</h2>
       <p>Tu registro en <strong>Clínica Salud Total</strong> ha sido exitoso.</p>
-      <p>Ahora puedes ingresar a la aplicación y comenzar a programar tus citas médicas de forma rápida y segura.</p>
-      <p>Estamos felices de tenerte con nosotros.</p>
-      <hr/>
-      <footer style="font-size: 0.9em; color: #888; margin-top: 20px;">
-        <p><strong>Clínica Salud Total</strong> – Sistema de Registro</p>
-        <p>Este es un mensaje automático, no respondas a este correo.</p>
-      </footer>
-    `
-  };
-
-  transporter.sendMail(mailOptions, (error, info) => {
-    if (error) {
-      console.log("Error al enviar correo de bienvenida:", error);
-    } else {
-      console.log("Correo de bienvenida enviado:", info.response);
-    }
+      <p>Ahora puedes ingresar a la aplicación y programar tus citas médicas.</p>
+      <hr/><small>Mensaje automático, no responder.</small>
+    `,
   });
+  console.log("📧 Bienvenida enviada a", destinatario);
 }
 
-function enviarCorreoRecuperacion(destinatario, nombre, contrasena) {
-  const mailOptions = {
-    from: correoFrom(),
+async function enviarCorreoRecuperacion(destinatario, nombre, contrasena) {
+  await sg.send({
+    from: fromName(),
     to: destinatario,
     subject: "Recuperación de contraseña - Clínica Salud Total",
     html: `
-      <h2 style="color: #e74c3c;">Recuperación de contraseña</h2>
+      <h2 style="color:#e74c3c;">Recuperación de contraseña</h2>
       <p>Hola <strong>${nombre}</strong>, has solicitado recuperar tu contraseña.</p>
       <p><strong>Tu contraseña actual es:</strong> ${contrasena}</p>
       <p>Te recomendamos cambiarla una vez inicies sesión.</p>
-      <hr/>
-      <footer style="font-size: 0.9em; color: #888; margin-top: 20px;">
-        <p><strong>Clínica Salud Total</strong> – Sistema Atención al Cliente</p>
-        <p>Este es un mensaje automático, no respondas a este correo.</p>
-      </footer>
-    `
-  };
-
-  return new Promise((resolve, reject) => {
-    transporter.sendMail(mailOptions, (error, info) => {
-      if (error) {
-        console.log("Error al enviar correo de recuperación:", error);
-        reject(error);
-      } else {
-        console.log("Correo de recuperación enviado:", info.response);
-        resolve(info);
-      }
-    });
+      <hr/><small>Mensaje automático, no responder.</small>
+    `,
   });
+  console.log("📧 Recuperación enviada a", destinatario);
 }
 
-function enviarCorreoActualizacion(destinatario, fecha, hora) {
-  const mailOptions = {
-    from: correoFrom(),
+async function enviarCorreoActualizacion(destinatario, fecha, hora) {
+  await sg.send({
+    from: fromName(),
     to: destinatario,
     subject: "Actualización de tu cita médica",
     html: `
-      <h2 style="color: #f39c12;">¡Cita médica actualizada!</h2>
-      <p>Tu cita ha sido <strong>actualizada</strong> con éxito.</p>
+      <h2 style="color:#f39c12;">¡Cita médica actualizada!</h2>
       <p><strong>Nueva Fecha:</strong> ${fecha}</p>
       <p><strong>Hora:</strong> ${hora}</p>
-      <p>Si no solicitaste esta modificación, por favor contacta a la clínica.</p>
-      <hr/>
-      <footer style="font-size: 0.9em; color: #888; margin-top: 20px;">
-        <p><strong>Clínica Salud Total</strong> – Sistema de Citas</p>
-        <p>Este es un mensaje automático, no respondas a este correo.</p>
-      </footer>
-    `
-  };
-
-  transporter.sendMail(mailOptions, (error, info) => {
-    if (error) {
-      console.log("Error al enviar correo de actualización:", error);
-    } else {
-      console.log("Correo de actualización enviado:", info.response);
-    }
+      <hr/><small>Mensaje automático, no responder.</small>
+    `,
   });
+  console.log("📧 Actualización enviada a", destinatario);
 }
 
-function enviarCorreoCancelacion(destinatario, fecha, hora) {
-  const mailOptions = {
-    from: correoFrom(),
+async function enviarCorreoCancelacion(destinatario, fecha, hora) {
+  await sg.send({
+    from: fromName(),
     to: destinatario,
     subject: "Cancelación de tu cita médica",
     html: `
-      <h2 style="color: #c0392b;">Cita cancelada</h2>
-      <p>Tu cita médica ha sido <strong>cancelada</strong> correctamente.</p>
+      <h2 style="color:#c0392b;">Cita cancelada</h2>
       <p><strong>Fecha:</strong> ${fecha}</p>
       <p><strong>Hora:</strong> ${hora}</p>
-      <p>Si esto fue un error, por favor agenda una nueva cita.</p>
-      <hr/>
-      <footer style="font-size: 0.9em; color: #888; margin-top: 20px;">
-        <p><strong>Clínica Salud Total</strong> – Sistema de Citas</p>
-        <p>Este es un mensaje automático, no respondas a este correo.</p>
-      </footer>
-    `
-  };
-
-  transporter.sendMail(mailOptions, (error, info) => {
-    if (error) {
-      console.log("Error al enviar correo de cancelación:", error);
-    } else {
-      console.log("Correo de cancelación enviado:", info.response);
-    }
+      <p>Si fue un error, agenda una nueva cita.</p>
+      <hr/><small>Mensaje automático, no responder.</small>
+    `,
   });
+  console.log("📧 Cancelación enviada a", destinatario);
 }
-/*Correos*/
 
+// Endpoint de prueba:
 app.get("/test-correo", async (req, res) => {
   try {
-    const info = await transporter.sendMail({
-      from: correoFrom("Clínica Salud Total (Test)"),
-      to: process.env.EMAIL_USER, // te lo envías a ti
-      subject: "Prueba SMTP",
-      text: "Hola, este es un test de SMTP con Gmail.",
+    await sg.send({
+      from: fromName(),
+      to: process.env.TEST_TO || (process.env.EMAIL_FROM?.match(/<(.+)>/) || [])[1] || "pruebascalendar0@gmail.com",
+      subject: "Prueba de envío (SendGrid + Render)",
+      text: "Si ves este correo, todo OK 🎉",
     });
-    res.json({ ok: true, messageId: info.messageId });
+    res.json({ ok: true });
   } catch (err) {
-    console.error("❌ /test-correo error:", err);
-    res.status(500).json({ ok: false, error: String(err), code: err.code });
+    console.error("❌ Error test-correo:", err);
+    res.status(500).json({ ok: false, error: String(err) });
   }
 });
+/*Correos*/
 
 /*Usuarios*/
 app.get("/usuarios",(req,res)=>{
