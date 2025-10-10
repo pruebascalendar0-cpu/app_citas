@@ -341,7 +341,7 @@ app.post("/usuario/recuperar-contrasena", (req, res) => {
 
 // === Nuevo flujo: Reset por CÓDIGO (solicitar → validar → cambiar) ===
 
-// Paso 1: Solicitar código
+// Paso 1: Solicitar código (sin expiración ni intentos)
 app.post("/usuario/reset/solicitar", (req, res) => {
   const { usuario_correo } = req.body;
   if (!usuario_correo) return res.status(400).json({ mensaje: "Correo requerido" });
@@ -352,100 +352,62 @@ app.post("/usuario/reset/solicitar", (req, res) => {
     if (rows.length === 0) return res.status(404).json({ mensaje: "Correo no registrado" });
 
     const { id_usuario, usuario_nombre, usuario_apellido } = rows[0];
-    // Generar un código único
-    const tryMakeCode = () => generarCodigo6();
-    const checkUnique = (codigo) =>
-      new Promise((resolve) => {
-        const q2 = "SELECT 1 FROM usuarios WHERE reset_codigo=? AND reset_used=0 AND reset_expires > NOW() LIMIT 1";
-        conexion.query(q2, [codigo], (e2, r2) => resolve(!e2 && r2.length === 0));
-      });
 
-    (async () => {
-      let codigo = tryMakeCode();
-      let intentos = 0;
-      // hasta 5 reintentos por colisión
-      while (!(await checkUnique(codigo)) && intentos < 5) {
-        codigo = tryMakeCode();
-        intentos++;
-      }
-      const expMinutes = RESET_EXP_MIN;
-      const upd = `
-        UPDATE usuarios
-          SET reset_codigo=?, reset_expires=DATE_ADD(NOW(), INTERVAL ? MINUTE), reset_used=0, reset_intentos=0
-        WHERE id_usuario=?`;
-      conexion.query(upd, [codigo, expMinutes, id_usuario], async (e3) => {
-        if (e3) return res.status(500).json({ mensaje: "No se pudo generar el código" });
-        const nombre = `${usuario_nombre} ${usuario_apellido}`;
-        try {
-          await enviarCorreoCodigoReset(usuario_correo, nombre, codigo, expMinutes);
-        } catch (_) { /* no romper si el correo falla */ }
-        res.json({ mensaje: "Código enviado a tu correo" });
-      });
-    })();
+    const generarCodigo6 = () => String(Math.floor(100000 + Math.random() * 900000));
+    const codigo = generarCodigo6();
+
+    const upd = `UPDATE usuarios SET reset_codigo=?, reset_used=0 WHERE id_usuario=?`;
+    conexion.query(upd, [codigo, id_usuario], async (e2) => {
+      if (e2) return res.status(500).json({ mensaje: "No se pudo generar el código" });
+      try {
+        await enviarCorreoCodigoReset(usuario_correo, `${usuario_nombre} ${usuario_apellido}`, codigo, ""); // el texto de minutos ya no aplica
+      } catch (_) {}
+      res.json({ mensaje: "Código enviado a tu correo" });
+    });
   });
 });
 
-// Paso 2: Validar código (opcional, útil para front)
+// Paso 2: Validar (opcional)
 app.post("/usuario/reset/validar", (req, res) => {
   const { usuario_correo, codigo } = req.body;
   if (!usuario_correo || !codigo) return res.status(400).json({ mensaje: "Datos incompletos" });
 
-  const q = `
-    SELECT id_usuario, reset_codigo, reset_expires, reset_used, reset_intentos
-    FROM usuarios WHERE usuario_correo=?`;
+  const q = `SELECT id_usuario, reset_codigo, reset_used FROM usuarios WHERE usuario_correo=?`;
   conexion.query(q, [usuario_correo], (err, rows) => {
     if (err) return res.status(500).json({ mensaje: "Error interno del servidor" });
     if (rows.length === 0) return res.status(404).json({ mensaje: "Correo no registrado" });
 
     const u = rows[0];
     if (!u.reset_codigo || u.reset_used) return res.status(400).json({ valido: false, mensaje: "No hay un código vigente. Solicítalo de nuevo." });
-    if (new Date(u.reset_expires) < new Date()) return res.status(400).json({ valido: false, mensaje: "Código expirado. Solicítalo de nuevo." });
+    if (u.reset_codigo !== String(codigo)) return res.status(400).json({ valido: false, mensaje: "Código incorrecto" });
 
-    if (u.reset_codigo !== String(codigo)) {
-      // incrementar intentos
-      const intentos = Math.min((u.reset_intentos || 0) + 1, RESET_MAX_INTENTOS);
-      const upd = `UPDATE usuarios SET reset_intentos=? WHERE id_usuario=?`;
-      conexion.query(upd, [intentos, u.id_usuario], () => { /* noop */ });
-      if (intentos >= RESET_MAX_INTENTOS) {
-        // invalidar el código
-        const inv = `UPDATE usuarios SET reset_used=1 WHERE id_usuario=?`;
-        conexion.query(inv, [u.id_usuario], () => { /* noop */ });
-        return res.status(429).json({ valido: false, mensaje: "Demasiados intentos. Solicita un nuevo código." });
-      }
-      return res.status(400).json({ valido: false, mensaje: "Código incorrecto" });
-    }
-
-    // ok
     return res.json({ valido: true, mensaje: "Código válido" });
   });
 });
 
-// Paso 3: Cambiar contraseña con código
+// Paso 3: Cambiar contraseña (sin expiración ni intentos)
 app.post("/usuario/reset/cambiar", (req, res) => {
   const { usuario_correo, codigo, nueva_contrasena } = req.body;
   if (!usuario_correo || !codigo || !nueva_contrasena) return res.status(400).json({ mensaje: "Datos incompletos" });
   if (String(nueva_contrasena).length < 6) return res.status(400).json({ mensaje: "La contraseña debe tener al menos 6 caracteres." });
 
-  const q = `
-    SELECT id_usuario, usuario_nombre, usuario_apellido, reset_codigo, reset_expires, reset_used, reset_intentos
-    FROM usuarios WHERE usuario_correo=?`;
+  const q = `SELECT id_usuario, reset_codigo, reset_used FROM usuarios WHERE usuario_correo=?`;
   conexion.query(q, [usuario_correo], (err, rows) => {
     if (err) return res.status(500).json({ mensaje: "Error interno del servidor" });
     if (rows.length === 0) return res.status(404).json({ mensaje: "Correo no registrado" });
 
     const u = rows[0];
     if (!u.reset_codigo || u.reset_used) return res.status(400).json({ mensaje: "No hay un código vigente. Solicítalo de nuevo." });
-    if (new Date(u.reset_expires) < new Date()) return res.status(400).json({ mensaje: "Código expirado. Solicítalo de nuevo." });
+    if (u.reset_codigo !== String(codigo)) return res.status(400).json({ mensaje: "Código incorrecto" });
 
-    if (u.reset_codigo !== String(codigo)) {
-      const intentos = Math.min((u.reset_intentos || 0) + 1, RESET_MAX_INTENTOS);
-      conexion.query("UPDATE usuarios SET reset_intentos=? WHERE id_usuario=?", [intentos, u.id_usuario], () => {});
-      if (intentos >= RESET_MAX_INTENTOS) {
-        conexion.query("UPDATE usuarios SET reset_used=1 WHERE id_usuario=?", [u.id_usuario], () => {});
-        return res.status(429).json({ mensaje: "Demasiados intentos. Solicita un nuevo código." });
-      }
-      return res.status(400).json({ mensaje: "Código incorrecto" });
-    }
+    const hashed = hashPassword(nueva_contrasena);
+    const upd = `UPDATE usuarios SET usuario_contrasena_hash=?, reset_used=1, reset_codigo=NULL WHERE id_usuario=?`;
+    conexion.query(upd, [hashed, u.id_usuario], (e2) => {
+      if (e2) return res.status(500).json({ mensaje: "No se pudo actualizar la contraseña" });
+      res.json({ mensaje: "Contraseña actualizada correctamente" });
+    });
+  });
+});
 
     // Código correcto → cambiar contraseña y marcar usado
     const hashed = hashPassword(nueva_contrasena);
