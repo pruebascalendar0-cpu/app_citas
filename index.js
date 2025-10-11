@@ -467,4 +467,4 @@ app.get("/citas/por-dia", (_, res) => {
 /* ============ START ============ */
 app.listen(PUERTO, () => console.log("🚀 Servidor en puerto " + PUERTO));
 
-module.exports = { toYYYYMMDD, verifyHash };
+module.exports = { toYYYYMMDD, verifyPassword };
