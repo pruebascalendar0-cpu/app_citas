@@ -8,15 +8,14 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
-const logReq = (req, res, next) => {
+app.use((req, res, next) => {
   req.rid = crypto.randomUUID().slice(0, 8);
   const t0 = Date.now();
   console.log(`[${req.rid}] -> ${req.method} ${req.originalUrl}`);
   if (["POST", "PUT", "PATCH"].includes(req.method)) try { console.log(`[${req.rid}] body:`, req.body); } catch {}
   res.on("finish", () => console.log(`[${req.rid}] <- ${res.statusCode} ${req.method} ${req.originalUrl} (${Date.now() - t0}ms)`));
   next();
-};
-app.use(logReq);
+});
 
 function toYYYYMMDD(v) {
   if (!v) return v;
@@ -56,7 +55,7 @@ const REPLY_TO = process.env.REPLY_TO || process.env.EMAIL_USER || "";
 async function sendViaGmailAPI({ to, subject, html, text, headers = {} }) {
   const oauth2 = new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, process.env.GMAIL_REDIRECT_URI);
   oauth2.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
-  const { token } = await oauth2.getAccessToken();
+  await oauth2.getAccessToken();
   const gmail = google.gmail({ version: "v1", auth: oauth2 });
   const subjEnc = `=?UTF-8?B?${Buffer.from(sanitizeHeader(subject), "utf8").toString("base64")}?=`;
   const lines = [
@@ -80,9 +79,7 @@ async function sendViaSMTP({ to, subject, html, text, headers = {} }) {
     host: process.env.SMTP_HOST || "smtp.gmail.com",
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || "false") === "true",
-    auth: process.env.EMAIL_PASSWORD
-      ? { user: process.env.EMAIL_USER, pass: (process.env.EMAIL_PASSWORD || "").replace(/\s+/g, "") }
-      : undefined,
+    auth: process.env.EMAIL_PASSWORD ? { user: process.env.EMAIL_USER, pass: (process.env.EMAIL_PASSWORD || "").replace(/\s+/g, "") } : undefined,
     pool: true,
     maxConnections: 3,
     maxMessages: 50,
@@ -168,7 +165,7 @@ app.post("/usuario/agregar", (req, res) => {
     usuario_contrasena_hash: hashPassword(b.usuario_contrasena),
     usuario_tipo: Number(b.usuario_tipo ?? 1),
   };
-  db.query("INSERT INTO usuarios SET ?", row, (e, r) => {
+  db.query("INSERT INTO usuarios SET ?", row, (e) => {
     if (e) {
       if (e.code === "ER_DUP_ENTRY") {
         if (e.sqlMessage?.includes("usuario_dni")) return res.status(400).json({ mensaje: "DNI ya registrado" });
@@ -225,6 +222,7 @@ app.put("/usuario/actualizar/:id", (req, res) => {
   };
   db.query("UPDATE usuarios SET ? WHERE id_usuario=?", [up, id], (e, r) => {
     if (e) return res.status(500).json({ mensaje: "Error al actualizar" });
+    if (!r.affectedRows) return res.status(404).json({ mensaje: "No encontrado" });
     res.json({ mensaje: "Actualizado" });
   });
 });
@@ -240,7 +238,7 @@ app.get("/usuarios", (_, res) => {
 app.post("/usuario/reset/solicitar", (req, res) => {
   const correo = String(req.body?.email || req.body?.usuario_correo || "").trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) return res.status(400).json({ ok: false, mensaje: "Correo inválido" });
-  const qUser = "SELECT id_usuario,usuario_nombre,usuario_apellido FROM usuarios WHERE LOWER(usuario_correo)=?";
+  const qUser = "SELECT id_usuario FROM usuarios WHERE LOWER(usuario_correo)=?";
   db.query(qUser, [correo], (e1, r1) => {
     if (e1) return res.status(500).json({ ok: false, mensaje: "Error en base de datos" });
     if (!r1.length) return res.json({ ok: true, mensaje: "Si el correo existe, se envió un código." });
@@ -271,7 +269,7 @@ app.post("/usuario/reset/cambiar", (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) return res.status(400).json({ ok: false, mensaje: "Correo inválido" });
   if (!/^\d{6}$/.test(pin)) return res.status(400).json({ ok: false, mensaje: "Código inválido" });
   if (nueva.length < 6) return res.status(400).json({ ok: false, mensaje: "La nueva contraseña debe tener mínimo 6 caracteres." });
-  const q = "SELECT reset_codigo, reset_expires, reset_used, reset_intentos FROM usuarios WHERE LOWER(usuario_correo)=?";
+  const q = "SELECT reset_codigo, reset_expires, reset_used FROM usuarios WHERE LOWER(usuario_correo)=?";
   db.query(q, [correo], (e1, r1) => {
     if (e1 || !r1.length) return res.status(400).json({ ok: false, mensaje: "Código inválido" });
     const row = r1[0];
@@ -366,7 +364,7 @@ app.post("/horario/registrar", (req, res) => {
   const row = {
     id_medico: Number(b.id_medico),
     horario_fecha: toYYYYMMDD(b.horario_fecha),
-    horario_hora: b.horario_hora,
+    horario_hora: b.horario_hora || b.horario_horas,
     horario_estado: Number(b.horario_estado ?? 0),
     id_especialidad: Number(b.id_especialidad),
   };
