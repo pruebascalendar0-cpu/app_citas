@@ -1,527 +1,532 @@
-// index.js
-// API Clínica UASC – Express + MySQL2 + Gmail API (googleapis)
-// Autor: Grupo 4 – AppMoviles (actualizado para Gmail API y mejoras de citas)
+// index.js – Clínica Salud Total (Express + MySQL2 + Gmail API)
+// Esquema compatible con tu BD (usuarios.usuario_contrasena_hash, reset_* en usuarios).
+require("dotenv").config();
 
-require('dotenv').config();
-const express = require('express');
-const bodyParser = require('body-parser');
-const cors = require('cors');
-const mysql = require('mysql2/promise');
-const { google } = require('googleapis');
+const express = require("express");
+const mysql = require("mysql2");
+const crypto = require("crypto");
+const { google } = require("googleapis");
 
-// ---------------------------
-// Configuración de servidor
-// ---------------------------
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+const PUERTO = process.env.PORT || 10000;
+app.use(express.json());
 
-// Puerto (Render usa PORT)
-const PORT = process.env.PORT || 10000;
+/* ============ Middleware de request-id y logging ============ */
+app.use((req, res, next) => {
+  req.rid = crypto.randomUUID().slice(0, 8);
+  const t0 = Date.now();
+  console.log(`[${req.rid}] -> ${req.method} ${req.originalUrl}`);
+  if (["POST", "PUT"].includes(req.method)) {
+    try { console.log(`[${req.rid}] body:`, req.body); } catch {}
+  }
+  res.on("finish", () => {
+    console.log(`[${req.rid}] <- ${res.statusCode} ${req.method} ${req.originalUrl} (${Date.now() - t0}ms)`);
+  });
+  next();
+});
 
-// ---------------------------
-// MySQL (pool)
-// ---------------------------
-const pool = mysql.createPool({
+/* =================== Gmail API =================== */
+const MAIL_STRATEGY = (process.env.MAIL_STRATEGY || "").toUpperCase(); // GMAIL_API
+const EMAIL_USER = process.env.EMAIL_USER || "";
+const EMAIL_FROM = process.env.EMAIL_FROM || `Clínica Salud Total <${EMAIL_USER}>`;
+const REPLY_TO  = process.env.REPLY_TO  || EMAIL_USER;
+
+let gmailClient = null;
+if (MAIL_STRATEGY === "GMAIL_API") {
+  gmailClient = new google.auth.OAuth2(
+    process.env.GMAIL_CLIENT_ID,
+    process.env.GMAIL_CLIENT_SECRET,
+    process.env.GMAIL_REDIRECT_URI
+  );
+  if (process.env.GMAIL_REFRESH_TOKEN) {
+    gmailClient.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
+  }
+}
+
+function b64url(s) {
+  return Buffer.from(s).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/,"");
+}
+async function enviarMail({ to, subject, html, text, category="notificaciones" }) {
+  if (!gmailClient) {
+    console.log(`[@mail] mock -> to=${to} subj="${subject}"`); return;
+  }
+  const raw = [
+    `From: ${EMAIL_FROM}`,
+    `To: ${to}`,
+    `Subject: ${String(subject||"").replace(/\r|\n/g," ")}`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/html; charset=UTF-8",
+    `Reply-To: ${REPLY_TO}`,
+    `X-Category: ${category}`,
+    "",
+    html || (text || "")
+  ].join("\r\n");
+  const gmail = google.gmail({ version:"v1", auth: gmailClient });
+  const res = await gmail.users.messages.send({ userId:"me", requestBody:{ raw: b64url(raw) } });
+  console.log(`[@mail] ok id=${res.data.id}`);
+}
+const wrap = (inner) => `
+  <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;line-height:1.5;color:#222;max-width:560px">
+    ${inner}
+    <hr style="border:none;border-top:1px solid #eee;margin:16px 0" />
+    <div style="font-size:12px;color:#777">Clínica Salud Total · Mensaje automático.</div>
+  </div>`;
+
+/* =================== Helpers =================== */
+function toYYYYMMDD(v) {
+  if (!v) return v;
+  const s = String(v);
+  if (s.includes("T")) return s.slice(0,10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = new Date(s); if (isNaN(d)) return s.slice(0,10);
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,"0"), day=String(d.getDate()).padStart(2,"0");
+  return `${y}-${m}-${day}`;
+}
+function verifyPassword(plain, stored) {
+  // stored = "salt:sha256(salt+plain)"
+  if (!stored || !stored.includes(":")) return false;
+  const [salt, hash] = stored.split(":");
+  const test = crypto.createHash("sha256").update(salt + plain).digest("hex");
+  return test.toLowerCase() === (hash || "").toLowerCase();
+}
+function hashPassword(plain) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.createHash("sha256").update(salt + plain).digest("hex");
+  return `${salt}:${hash}`;
+}
+const genCode6 = ()=>Math.floor(100000+Math.random()*900000).toString();
+
+/* =================== BD =================== */
+const conexion = mysql.createConnection({
   host: process.env.DB_HOST,
-  port: Number(process.env.DB_PORT || 3306),
+  port: process.env.DB_PORT,
+  database: process.env.DB_NAME,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  connectionLimit: 8,
-  decimalNumbers: true
+});
+conexion.connect((err) => {
+  if (err) throw err;
+  console.log("✅ Conexión MySQL OK");
+  conexion.query("SET time_zone='-05:00'", ()=>{});
 });
 
-async function db(q, params = []) {
-  try {
-    const [rows] = await pool.query(q, params);
-    return rows;
-  } catch (err) {
-    console.error('[DB] Error:', err.code || err.message);
-    throw err;
-  }
-}
+/* =================== Salud =================== */
+app.get("/", (_,res)=>res.send("API Clínica Salud Total"));
+app.get("/health", (_,res)=>res.json({ok:true, uptime:process.uptime(), mail:MAIL_STRATEGY}));
 
-// ---------------------------
-// Gmail API (googleapis)
-// ---------------------------
-const MAIL_STRATEGY = (process.env.MAIL_STRATEGY || '').toUpperCase(); // "GMAIL_API"
-const GMAIL_USER = process.env.EMAIL_USER || ''; // cuenta @gmail.com usada para enviar
+/* =================== Emails prearmados =================== */
+const correoConfirmacion = (to, f, h)=>
+  enviarMail({ to, subject:"Confirmación de tu cita médica",
+    html: wrap(`<h2>Cita confirmada</h2><p><b>Fecha:</b> ${f}<br/><b>Hora:</b> ${h}</p>`),
+    category:"cita-confirmada" });
+const correoActualizacion = (to, f, h)=>
+  enviarMail({ to, subject:"Actualización de tu cita médica",
+    html: wrap(`<h2>Cita actualizada</h2><p><b>Fecha:</b> ${f}<br/><b>Hora:</b> ${h}</p>`),
+    category:"cita-actualizada" });
+const correoCancelacion = (to, f, h)=>
+  enviarMail({ to, subject:"Cancelación de tu cita médica",
+    html: wrap(`<h2>Cita cancelada</h2><p><b>Fecha:</b> ${f}<br/><b>Hora:</b> ${h}</p>`),
+    category:"cita-cancelada" });
+const correoBienvenida = (to, nombre)=>
+  enviarMail({ to, subject:"Bienvenido a Clínica Salud Total",
+    html: wrap(`<h2>¡Bienvenido, ${nombre}!</h2><p>Tu registro fue exitoso.</p>`),
+    category:"bienvenida" });
 
-const oauth2Client =
-  MAIL_STRATEGY === 'GMAIL_API'
-    ? new google.auth.OAuth2(
-        process.env.GMAIL_CLIENT_ID,
-        process.env.GMAIL_CLIENT_SECRET,
-        process.env.GMAIL_REDIRECT_URI
-      )
-    : null;
-
-if (oauth2Client && process.env.GMAIL_REFRESH_TOKEN) {
-  oauth2Client.setCredentials({
-    refresh_token: process.env.GMAIL_REFRESH_TOKEN
+/* =================== USUARIOS =================== */
+// LOGIN
+app.post("/usuario/login", (req, res) => {
+  const { usuario_correo, password } = req.body || {};
+  if (!usuario_correo || !password) return res.status(400).json({ mensaje: "Correo y password requeridos" });
+  const q = `
+    SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo, usuario_contrasena_hash
+    FROM usuarios WHERE usuario_correo=?`;
+  conexion.query(q, [usuario_correo], (e, rows) => {
+    if (e) return res.status(500).json({ mensaje: "Error en la base de datos" });
+    if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
+    const u = rows[0];
+    if (!verifyPassword(password, u.usuario_contrasena_hash || "")) {
+      return res.status(401).json({ mensaje: "Contraseña incorrecta" });
+    }
+    res.json({
+      id_usuario: u.id_usuario,
+      usuario_nombre: u.usuario_nombre,
+      usuario_apellido: u.usuario_apellido,
+      usuario_correo: u.usuario_correo,
+      usuario_tipo: u.usuario_tipo,
+    });
   });
-}
-
-function toBase64Url(str) {
-  return Buffer.from(str)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-}
-
-async function sendMail({ to, subject, html, category = 'notificacion' }) {
-  if (MAIL_STRATEGY !== 'GMAIL_API') {
-    console.log(`[@mail] (mock) to=${to} subject="${subject}" category=${category}`);
-    return { ok: true, mock: true };
-  }
-  if (!oauth2Client) {
-    console.warn('[@mail] Gmail API no inicializado.');
-    return { ok: false, error: 'gmail_not_ready' };
-  }
-  try {
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    const fromDisplay = process.env.EMAIL_FROM || `Clinica Salud <${GMAIL_USER}>`;
-    const raw = [
-      `From: ${fromDisplay}`,
-      `To: ${to}`,
-      `Subject: ${subject}`,
-      'MIME-Version: 1.0',
-      'Content-Type: text/html; charset="UTF-8"',
-      `X-Category: ${category}`,
-      '',
-      html || ''
-    ].join('\r\n');
-
-    const res = await gmail.users.messages.send({
-      userId: 'me',
-      requestBody: { raw: toBase64Url(raw) }
-    });
-
-    console.log(`[@mail] OK to=${to} subject="${subject}" id=${res.data.id}`);
-    return { ok: true, id: res.data.id };
-  } catch (err) {
-    console.error('[@mail] error Gmail API:', err?.message || err);
-    return { ok: false, error: err?.message || 'mail_error' };
-  }
-}
-
-// ---------------------------
-// Utils de fechas y logs
-// ---------------------------
-function todayStr() {
-  const d = new Date();
-  const mm = `${d.getMonth() + 1}`.padStart(2, '0');
-  const dd = `${d.getDate()}`.padStart(2, '0');
-  return `${d.getFullYear()}-${mm}-${dd}`;
-}
-function normalizeDate(d) {
-  // Acepta "2025-10-11" o "2025/10/11" o con "T00:00:00Z"
-  return (d || '').replace('T00:00:00.000Z', '').replace(/\//g, '-');
-}
-function ok(res, data) {
-  return res.status(200).json({ ok: true, data });
-}
-function fail(res, code = 500, message = 'error') {
-  return res.status(code).json({ ok: false, message });
-}
-
-// ---------------------------
-// Salud del servicio
-// ---------------------------
-app.head('/', (_, res) => res.status(200).end());
-app.get('/', (_, res) => res.status(200).send('API Clínica UASC OK'));
-
-// ---------------------------
-// Usuarios (simple)
-// ---------------------------
-app.get('/usuarios', async (req, res) => {
-  console.log('[usuarios] -> consultando');
-  try {
-    const rows = await db('SELECT * FROM usuarios ORDER BY id_usuario DESC');
-    console.log(`[usuarios] -> ${rows.length} usuario(s)`);
-    ok(res, rows);
-  } catch {
-    fail(res, 500, 'db_error');
-  }
 });
 
-app.post('/usuario/login', async (req, res) => {
-  const { usuario_correo = '', password = '' } = req.body || {};
-  console.log('/usuario/login body:', { usuario_correo, password: password ? '(len)' : '' });
-  if (!usuario_correo || !password) return fail(res, 400, 'email_y_password_requeridos');
+// Registro simple PACIENTE
+app.post("/usuario/agregar", (req, res) => {
+  const { usuario_dni, usuario_nombre, usuario_apellido, usuario_correo, usuario_contrasena } = req.body || {};
+  if (!/^\d{8}$/.test(usuario_dni || "")) return res.status(400).json({ mensaje: "DNI inválido (8 dígitos)" });
+  if (!usuario_nombre || !usuario_apellido) return res.status(400).json({ mensaje: "Nombre y apellido obligatorios" });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(usuario_correo || "")) return res.status(400).json({ mensaje: "Correo inválido" });
+  if (!usuario_contrasena || usuario_contrasena.length < 6) return res.status(400).json({ mensaje: "La contraseña debe tener al menos 6 caracteres." });
 
-  try {
-    const rows = await db(
-      'SELECT id_usuario, usuario_nombre, usuario_rol, usuario_correo FROM usuarios WHERE usuario_correo=? AND usuario_password=? LIMIT 1',
-      [usuario_correo, password]
-    );
-    if (rows.length === 0) return fail(res, 401, 'credenciales_invalidas');
-    ok(res, rows[0]);
-  } catch {
-    fail(res, 500, 'db_error');
-  }
-});
-
-// ---------------------------
-// Especialidades (incluye rutas que te marcaban 404)
-// ---------------------------
-app.get('/especialidades', async (req, res) => {
-  try {
-    const rows = await db('SELECT * FROM especialidades ORDER BY id_especialidad DESC');
-    ok(res, rows);
-  } catch {
-    fail(res, 500, 'db_error');
-  }
-});
-
-app.post('/especialidad/agregar', async (req, res) => {
-  const { especialidad_nombre = '' } = req.body || {};
-  if (!especialidad_nombre) return fail(res, 400, 'nombre_requerido');
-  try {
-    const r = await db('INSERT INTO especialidades (especialidad_nombre) VALUES (?)', [
-      especialidad_nombre
-    ]);
-    ok(res, { id_especialidad: r.insertId, especialidad_nombre });
-  } catch {
-    fail(res, 500, 'db_error');
-  }
-});
-
-app.put('/especialidad/actualizar/:id', async (req, res) => {
-  const id = Number(req.params.id || 0);
-  const { especialidad_nombre = '' } = req.body || {};
-  if (!id || !especialidad_nombre) return fail(res, 400, 'datos_invalidos');
-  try {
-    const r = await db('UPDATE especialidades SET especialidad_nombre=? WHERE id_especialidad=?', [
-      especialidad_nombre,
-      id
-    ]);
-    if (r.affectedRows === 0) return fail(res, 404, 'no_encontrado');
-    ok(res, { id_especialidad: id, especialidad_nombre });
-  } catch {
-    fail(res, 500, 'db_error');
-  }
-});
-
-// ---------------------------
-// Horarios y disponibilidad
-// ---------------------------
-
-// Obtiene horarios disponibles para un médico en una fecha.
-// URL usada en tu app: /horarios/2025-10-11&1  (fecha & id_medico)
-app.get('/horarios/:fecha&:id_medico', async (req, res) => {
-  const fecha = normalizeDate(req.params.fecha || todayStr());
-  const id_medico = Number(req.params.id_medico || 0);
-
-  try {
-    // Slots base (puedes ajustar aquí tu plantilla de horarios)
-    const baseSlots = [];
-    const start = 8; // 08:00
-    const end = 17; // 17:00
-    for (let h = start; h < end; h++) {
-      baseSlots.push(`${String(h).padStart(2, '0')}:00`);
-      baseSlots.push(`${String(h).padStart(2, '0')}:30`);
-    }
-
-    // Ocupados por citas
-    const citas = await db(
-      'SELECT cita_hora FROM citas WHERE id_medico=? AND cita_fecha=? AND cita_estado IN (1,2,3,4)',
-      [id_medico, fecha]
-    );
-    const ocupados = new Set(citas.map((r) => r.cita_hora));
-
-    // Bloqueos manuales (si tienes una tabla; si no, ignora)
-    await db(
-      'CREATE TABLE IF NOT EXISTS horarios_bloqueados (id INT AUTO_INCREMENT PRIMARY KEY, id_medico INT NOT NULL, fecha DATE NOT NULL, hora VARCHAR(5) NOT NULL, UNIQUE KEY uk(id_medico, fecha, hora))'
-    );
-    const blq = await db(
-      'SELECT hora FROM horarios_bloqueados WHERE id_medico=? AND fecha=?',
-      [id_medico, fecha]
-    );
-    blq.forEach((b) => ocupados.add(b.hora));
-
-    const disponibles = baseSlots.filter((h) => !ocupados.has(h));
-    ok(res, { fecha, id_medico, disponibles });
-  } catch (err) {
-    console.error('/horarios error:', err.message);
-    fail(res, 500, 'db_error');
-  }
-});
-
-// Ocupar / liberar un slot manualmente
-// Uso visto: PUT /horario/editar/2/2025-10-11T00:00:00.000Z/15:00  body:{accion:"ocupar"|"liberar"}
-app.put('/horario/editar/:id_medico/:fecha/:hora', async (req, res) => {
-  const id_medico = Number(req.params.id_medico || 0);
-  const fecha = normalizeDate(req.params.fecha || todayStr());
-  const hora = (req.params.hora || '').slice(0, 5);
-  const accion = (req.body?.accion || '').toLowerCase();
-
-  try {
-    await db(
-      'CREATE TABLE IF NOT EXISTS horarios_bloqueados (id INT AUTO_INCREMENT PRIMARY KEY, id_medico INT NOT NULL, fecha DATE NOT NULL, hora VARCHAR(5) NOT NULL, UNIQUE KEY uk(id_medico, fecha, hora))'
-    );
-
-    let affected = 0;
-    if (accion === 'ocupar') {
-      const r = await db(
-        'INSERT IGNORE INTO horarios_bloqueados (id_medico, fecha, hora) VALUES (?,?,?)',
-        [id_medico, fecha, hora]
-      );
-      affected = r.affectedRows;
-    } else if (accion === 'liberar') {
-      const r = await db(
-        'DELETE FROM horarios_bloqueados WHERE id_medico=? AND fecha=? AND hora=?',
-        [id_medico, fecha, hora]
-      );
-      affected = r.affectedRows;
-    } else {
-      return fail(res, 400, 'accion_invalida');
-    }
-    ok(res, { id_medico, fecha, hora, accion, affected });
-  } catch (err) {
-    console.error('/horario/editar error:', err.message);
-    fail(res, 500, 'db_error');
-  }
-});
-
-// ---------------------------
-// Citas
-// ---------------------------
-
-// Lista por día (si no envías fecha => hoy). En tu log: GET /citas/por-dia
-app.get('/citas/por-dia', async (req, res) => {
-  const fecha = normalizeDate(req.query.fecha || todayStr());
-  console.log('/citas/por-dia ->', fecha);
-  try {
-    const rows = await db(
-      `SELECT c.*, u.usuario_nombre, u.usuario_correo, m.medico_nombre
-       FROM citas c
-       LEFT JOIN usuarios u ON u.id_usuario=c.id_usuario
-       LEFT JOIN medicos m ON m.id_medico=c.id_medico
-       WHERE c.cita_fecha=?
-       ORDER BY c.cita_hora ASC`,
-      [fecha]
-    );
-    ok(res, rows);
-  } catch (err) {
-    console.error('/citas/por-dia error:', err.message);
-    ok(res, []); // devuelve lista vacía en vez de 500
-  }
-});
-
-// Obtener por ID (tu log muestra /citas/0 fallando; devolvemos 404 en vez de 500)
-app.get('/citas/:id', async (req, res) => {
-  const id = Number(req.params.id || 0);
-  console.log(`/citas/${id} -> consultando`);
-  if (!id) return fail(res, 404, 'no_encontrado');
-  try {
-    const rows = await db('SELECT * FROM citas WHERE id_cita=? LIMIT 1', [id]);
-    if (rows.length === 0) return fail(res, 404, 'no_encontrado');
-    ok(res, rows[0]);
-  } catch {
-    fail(res, 500, 'db_error');
-  }
-});
-
-// Crear cita (tu payload observado)
-app.post('/cita/agregar', async (req, res) => {
-  const {
-    id_usuario,
-    id_medico,
-    cita_fecha,
-    cita_hora,
-    usuario_correo = ''
-  } = (req.body || {});
-
-  const clean = {
-    id_usuario: Number(id_usuario || 0),
-    id_medico: Number(id_medico || 0),
-    cita_fecha: normalizeDate(cita_fecha),
-    cita_hora: (cita_hora || '').slice(0, 5)
+  const row = {
+    usuario_dni,
+    usuario_nombre,
+    usuario_apellido,
+    usuario_correo,
+    usuario_contrasena_hash: hashPassword(usuario_contrasena),
+    usuario_tipo: 1, // paciente
   };
-  console.log('/cita/agregar payload saneado:', clean);
-
-  if (!clean.id_usuario || !clean.id_medico || !clean.cita_fecha || !clean.cita_hora) {
-    return fail(res, 400, 'datos_invalidos');
-  }
-
-  try {
-    // numero_orden = cantidad de citas ya registradas para ese médico y fecha + 1
-    const count = await db(
-      'SELECT COUNT(*) AS n FROM citas WHERE id_medico=? AND cita_fecha=?',
-      [clean.id_medico, clean.cita_fecha]
-    );
-    const numero_orden = Number(count[0]?.n || 0) + 1;
-    console.log('/cita/agregar numero_orden calculado:', numero_orden);
-
-    const r = await db(
-      `INSERT INTO citas (id_usuario, id_medico, cita_fecha, cita_hora, cita_estado, numero_orden)
-       VALUES (?, ?, ?, ?, 1, ?)`,
-      [clean.id_usuario, clean.id_medico, clean.cita_fecha, clean.cita_hora, numero_orden]
-    );
-
-    // Marcar el slot como bloqueado para evitar doble reserva "manual"
-    await db(
-      'INSERT IGNORE INTO horarios_bloqueados (id_medico, fecha, hora) VALUES (?,?,?)',
-      [clean.id_medico, clean.cita_fecha, clean.cita_hora]
-    );
-
-    // Email (buscamos correo si no vino en body)
-    let to = usuario_correo;
-    if (!to) {
-      const u = await db('SELECT usuario_correo FROM usuarios WHERE id_usuario=?', [
-        clean.id_usuario
-      ]);
-      to = u[0]?.usuario_correo || '';
+  conexion.query("INSERT INTO usuarios SET ?", row, (err) => {
+    if (err) {
+      if (err.code === "ER_DUP_ENTRY") {
+        if (err.sqlMessage?.includes("usuario_dni")) return res.status(400).json({ mensaje: "DNI ya registrado" });
+        if (err.sqlMessage?.includes("usuario_correo")) return res.status(400).json({ mensaje: "Correo ya registrado" });
+      }
+      return res.status(500).json({ mensaje: "Error al registrar usuario" });
     }
-    console.log('/cita/agregar correo a:', to || '(sin correo)');
-
-    if (to) {
-      await sendMail({
-        to,
-        subject: 'Confirmación de tu cita médica',
-        category: 'cita-confirmada',
-        html: `
-          <div style="font-family:Arial,Helvetica,sans-serif">
-            <h2>Tu cita fue registrada ✅</h2>
-            <p><b>Fecha:</b> ${clean.cita_fecha}</p>
-            <p><b>Hora:</b> ${clean.cita_hora}</p>
-            <p><b>N° de orden:</b> ${numero_orden}</p>
-            <p>Gracias por confiar en Clínica Salud.</p>
-          </div>
-        `
-      });
-    }
-
-    ok(res, { id_cita: r.insertId, numero_orden, ...clean });
-  } catch (err) {
-    console.error('/cita/agregar error:', err.message);
-    fail(res, 500, 'db_error');
-  }
+    correoBienvenida(usuario_correo, `${usuario_nombre} ${usuario_apellido}`).catch(()=>{});
+    res.json({ mensaje: "Usuario registrado correctamente." });
+  });
 });
 
-// Obtener cita por usuario + orden (tu app consulta /cita/usuario/:id/orden/:orden)
-app.get('/cita/usuario/:id_usuario/orden/:orden', async (req, res) => {
-  const id_usuario = Number(req.params.id_usuario || 0);
-  const orden = Number(req.params.orden || 0);
-  if (!id_usuario || !orden) return fail(res, 400, 'datos_invalidos');
-  try {
-    const rows = await db(
-      'SELECT * FROM citas WHERE id_usuario=? AND numero_orden=? ORDER BY id_cita DESC LIMIT 1',
-      [id_usuario, orden]
-    );
-    if (rows.length === 0) return fail(res, 404, 'no_encontrado');
-    ok(res, rows[0]);
-  } catch {
-    fail(res, 500, 'db_error');
-  }
+// Listado (panel admin)
+app.get("/usuarios", (_req, res) => {
+  const sql = `
+    SELECT id_usuario, usuario_dni, usuario_nombre, usuario_apellido,
+           usuario_correo, usuario_tipo
+    FROM usuarios
+    ORDER BY id_usuario ASC`;
+  conexion.query(sql, (e, rows) => {
+    if (e) return res.status(500).json({ error: "Error al cargar usuarios" });
+    res.json({ listaUsuarios: rows });
+  });
 });
 
-// Editar/rehabilitar cita
-app.put('/cita/:id', async (req, res) => {
-  const id = Number(req.params.id || 0);
-  const { cita_fecha, cita_hora, cita_estado } = req.body || {};
-  if (!id) return fail(res, 400, 'id_invalido');
-
-  try {
-    const set = [];
-    const vals = [];
-    if (cita_fecha) {
-      set.push('cita_fecha=?');
-      vals.push(normalizeDate(cita_fecha));
-    }
-    if (cita_hora) {
-      set.push('cita_hora=?');
-      vals.push(cita_hora.slice(0, 5));
-    }
-    if (typeof cita_estado !== 'undefined') {
-      set.push('cita_estado=?');
-      vals.push(Number(cita_estado));
-    }
-    if (!set.length) return fail(res, 400, 'sin_cambios');
-
-    vals.push(id);
-    const r = await db(`UPDATE citas SET ${set.join(', ')} WHERE id_cita=?`, vals);
-    if (r.affectedRows === 0) return fail(res, 404, 'no_encontrado');
-
-    ok(res, { id_cita: id, actualizado: true });
-  } catch (err) {
-    console.error('/cita/:id PUT error:', err.message);
-    fail(res, 500, 'db_error');
+/* ====== RESET DE CONTRASEÑA (campos reset_* en usuarios) ====== */
+// solicitar código
+app.post("/usuario/reset/solicitar", (req, res) => {
+  const { email } = req.body || {};
+  const correo = String(email || "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
+    return res.status(400).json({ ok:false, mensaje:"Correo inválido" });
   }
-});
-
-// Cancelar cita
-app.delete('/cita/:id', async (req, res) => {
-  const id = Number(req.params.id || 0);
-  if (!id) return fail(res, 400, 'id_invalido');
-
-  try {
-    const rows = await db('SELECT * FROM citas WHERE id_cita=? LIMIT 1', [id]);
-    if (rows.length === 0) return fail(res, 404, 'no_encontrado');
-    const c = rows[0];
-
-    await db('UPDATE citas SET cita_estado=0 WHERE id_cita=?', [id]); // 0 = cancelada
-    await db('DELETE FROM horarios_bloqueados WHERE id_medico=? AND fecha=? AND hora=?', [
-      c.id_medico,
-      c.cita_fecha,
-      c.cita_hora
-    ]);
-
-    // Notificar
-    const u = await db('SELECT usuario_correo FROM usuarios WHERE id_usuario=?', [c.id_usuario]);
-    const to = u[0]?.usuario_correo || '';
-    if (to) {
-      await sendMail({
-        to,
-        subject: 'Tu cita fue cancelada',
-        category: 'cita-cancelada',
-        html: `
-          <div style="font-family:Arial,Helvetica,sans-serif">
-            <h2>Cita cancelada ❌</h2>
-            <p>Fecha: ${c.cita_fecha}</p>
-            <p>Hora: ${c.cita_hora}</p>
-            <p>Si no fuiste tú, por favor contáctanos.</p>
-          </div>
-        `
-      });
-    }
-
-    ok(res, { id_cita: id, cancelada: true });
-  } catch (err) {
-    console.error('/cita/:id DELETE error:', err.message);
-    fail(res, 500, 'db_error');
-  }
-});
-
-// ---------------------------
-// Arranque
-// ---------------------------
-(async () => {
-  try {
-    // Verifica conexión DB
-    await pool.query('SELECT 1');
-    console.log('✅ Conexión MySQL OK');
-
-    // Tablas auxiliares si faltan (no rompe si ya existen)
-    await db(
-      `CREATE TABLE IF NOT EXISTS reset_codes (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        usuario_correo VARCHAR(255) NOT NULL,
-        code VARCHAR(10) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )`
-    );
-
-    app.listen(PORT, () => {
-      console.log(`🚀 Servidor en puerto ${PORT}`);
-      console.log(`📧 Mail strategy: ${MAIL_STRATEGY || 'disabled'}`);
+  // Genera un código (intenta evitar colisión con UNIQUE uq_reset_codigo)
+  const intentar = (retries=5) => {
+    const code = genCode6();
+    const q = `
+      UPDATE usuarios
+         SET reset_codigo=?, reset_expires=DATE_ADD(NOW(), INTERVAL 15 MINUTE),
+             reset_used=0, reset_intentos=0
+       WHERE LOWER(usuario_correo)=?`;
+    conexion.query(q, [code, correo], async (e, r) => {
+      if (e && e.code === "ER_DUP_ENTRY" && retries > 0) return intentar(retries-1);
+      if (e) return res.status(500).json({ ok:false, mensaje:"No se pudo generar el código" });
+      if (r.affectedRows === 0) {
+        // Respuesta genérica para no filtrar existencia
+        return res.json({ ok:true, mensaje:"Si el correo existe, se envió un código." });
+      }
+      try {
+        await enviarMail({
+          to: correo,
+          subject: "Código de verificación - Restablecer contraseña",
+          html: wrap(`
+            <h2>Restablecer contraseña</h2>
+            <p>Usa este código (vence en 15 min):</p>
+            <p style="font-size:22px;letter-spacing:3px;"><strong>${code}</strong></p>
+          `),
+          category: "reset-password",
+        });
+        res.json({ ok:true, mensaje:"Código enviado" });
+      } catch (err) {
+        res.status(500).json({ ok:false, mensaje:"No se pudo enviar el código" });
+      }
     });
-  } catch (err) {
-    console.error('❌ Error inicializando servidor:', err.message);
-    process.exit(1);
+  };
+  intentar();
+});
+
+// cambiar contraseña
+app.post("/usuario/reset/cambiar", (req, res) => {
+  const { email, code, new_password } = req.body || {};
+  const correo = String(email || "").trim().toLowerCase();
+  const pin = String(code || "").trim();
+  const nueva = String(new_password || "");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) return res.status(400).json({ ok:false, mensaje:"Correo inválido" });
+  if (!/^\d{6}$/.test(pin)) return res.status(400).json({ ok:false, mensaje:"Código inválido" });
+  if (nueva.length < 6) return res.status(400).json({ ok:false, mensaje:"La nueva contraseña debe tener mínimo 6 caracteres." });
+
+  const sel = `
+    SELECT id_usuario, reset_expires, reset_used, reset_intentos
+      FROM usuarios
+     WHERE LOWER(usuario_correo)=? AND reset_codigo=?
+     LIMIT 1`;
+  conexion.query(sel, [correo, pin], (e1, r1) => {
+    if (e1) return res.status(500).json({ ok:false, mensaje:"Error en base de datos" });
+    if (!r1.length) {
+      // suma intento si existe usuario
+      conexion.query(
+        "UPDATE usuarios SET reset_intentos = LEAST(reset_intentos+1,10) WHERE LOWER(usuario_correo)=?",
+        [correo], ()=>{}
+      );
+      return res.status(400).json({ ok:false, mensaje:"Código inválido" });
+    }
+    const row = r1[0];
+    if (row.reset_used) return res.status(400).json({ ok:false, mensaje:"Código ya utilizado" });
+    if (new Date(row.reset_expires).getTime() < Date.now()) return res.status(400).json({ ok:false, mensaje:"Código vencido" });
+
+    const newHash = hashPassword(nueva);
+    const upd = `
+      UPDATE usuarios
+         SET usuario_contrasena_hash=?,
+             reset_used=1, reset_codigo=NULL, reset_expires=NULL, reset_intentos=0
+       WHERE id_usuario=?`;
+    conexion.query(upd, [newHash, row.id_usuario], (e2, r2) => {
+      if (e2) return res.status(500).json({ ok:false, mensaje:"No se pudo actualizar la contraseña" });
+      if (r2.affectedRows === 0) return res.status(400).json({ ok:false, mensaje:"No se encontró el usuario" });
+      res.json({ ok:true, mensaje:"Contraseña actualizada" });
+    });
+  });
+});
+
+/* =================== ESPECIALIDADES / MÉDICOS / HORARIOS =================== */
+app.get("/especialidades", (_req, res) => {
+  conexion.query("SELECT * FROM especialidades", (e, r) => {
+    if (e) return res.status(500).json({ error: e.message });
+    res.json({ listaEspecialidades: r });
+  });
+});
+
+// Listado de horarios por fecha + especialidad (fecha saneada)
+app.get("/horarios/:parametro", (req, res) => {
+  const [rawFecha, idEsp] = (req.params.parametro || "").split("&");
+  const fecha = toYYYYMMDD(rawFecha);
+  const consulta = `
+    SELECT h.*,
+           TIME_FORMAT(h.horario_hora,'%H:%i') AS horario_horas,
+           u.usuario_nombre AS medico_nombre,
+           u.usuario_apellido AS medico_apellido,
+           e.especialidad_nombre
+    FROM horarios_medicos h
+    INNER JOIN medicos m ON h.id_medico = m.id_medico
+    INNER JOIN usuarios u ON m.id_medico = u.id_usuario
+    INNER JOIN especialidades e ON h.id_especialidad = e.id_especialidad
+    WHERE h.horario_fecha = STR_TO_DATE(?, '%Y-%m-%d')
+      AND h.id_especialidad = ?
+      AND h.horario_estado = 0
+    ORDER BY h.horario_hora ASC`;
+  conexion.query(consulta, [fecha, idEsp], (error, rpta) => {
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ listaHorarios: rpta });
+  });
+});
+
+// Horas disponibles calculando huecos (8:00–16:00 cada hora)
+app.get("/horarios/disponibles/:id_medico/:fecha/:id_especialidad", (req, res) => {
+  const { id_medico, id_especialidad } = req.params;
+  const fecha = toYYYYMMDD(req.params.fecha);
+  const todas = Array.from({ length: 9 }, (_, i) => `${(8 + i).toString().padStart(2, "0")}:00`);
+  const q = `
+    SELECT TIME_FORMAT(horario_hora,'%H:%i') AS hora
+    FROM horarios_medicos
+    WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND id_especialidad=?`;
+  conexion.query(q, [id_medico, fecha, id_especialidad], (e, r) => {
+    if (e) return res.status(500).json({ error: "Error al consultar horarios" });
+    const ocupadas = r.map((x) => x.hora);
+    const disponibles = todas.filter((h) => !ocupadas.includes(h));
+    res.json({ horariosDisponibles: disponibles });
+  });
+});
+
+// Horarios registrados (libres = estado 0)
+app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", (req, res) => {
+  const { id_medico, id_especialidad } = req.params;
+  const fecha = toYYYYMMDD(req.params.fecha);
+  const sql = `
+    SELECT TIME_FORMAT(horario_hora,'%H:%i') AS horario_hora
+    FROM horarios_medicos
+    WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND id_especialidad=? AND horario_estado=0
+    ORDER BY horario_hora ASC`;
+  conexion.query(sql, [id_medico, fecha, id_especialidad], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error interno del servidor" });
+    res.json({ horarios: rows.map((r) => r.horario_hora) });
+  });
+});
+
+// Editar/ocupar/liberar/eliminar un horario
+app.put("/horario/editar/:id_medico/:fecha/:hora", (req, res) => {
+  const { id_medico } = req.params;
+  const fecha = toYYYYMMDD(req.params.fecha);
+  const hora = req.params.hora;
+  const { accion } = req.body || {};
+
+  if (!/^\d{2}:\d{2}$/.test(hora)) {
+    return res.status(400).json({ mensaje: "Hora inválida (HH:mm)" });
   }
-})();
+
+  if (accion === "ocupar") {
+    const q = `
+      UPDATE horarios_medicos SET horario_estado=1
+      WHERE id_medico=? AND horario_fecha=STR_TODATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+    return conexion.query(q, [id_medico, fecha, hora], (e, r) => {
+      if (e) return res.status(500).json({ mensaje: "Error al ocupar horario" });
+      res.json({ mensaje: "Horario ocupado" });
+    });
+  }
+  if (accion === "liberar") {
+    const q = `
+      UPDATE horarios_medicos SET horario_estado=0
+      WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+    return conexion.query(q, [id_medico, fecha, hora], (e, r) => {
+      if (e) return res.status(500).json({ mensaje: "Error al liberar horario" });
+      res.json({ mensaje: "Horario liberado" });
+    });
+  }
+  if (accion === "eliminar") {
+    const q = `
+      DELETE FROM horarios_medicos
+      WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+    return conexion.query(q, [id_medico, fecha, hora], (e, r) => {
+      if (e) return res.status(500).json({ mensaje: "Error al eliminar horario" });
+      res.json({ mensaje: "Horario eliminado" });
+    });
+  }
+  return res.status(400).json({ mensaje: "Acción inválida (ocupar|liberar|eliminar)" });
+});
+
+/* =================== CITAS =================== */
+// Agregar cita
+app.post("/cita/agregar", (req, res) => {
+  let { id_usuario, id_medico, cita_fecha, cita_hora } = req.body || {};
+  cita_fecha = toYYYYMMDD(cita_fecha);
+
+  const qOrden = "SELECT COUNT(*) AS total FROM citas WHERE id_usuario = ?";
+  conexion.query(qOrden, [id_usuario], (e1, r1) => {
+    if (e1) return res.status(500).json({ error: "Error al calcular número de orden" });
+    const numero_orden = (r1[0]?.total || 0) + 1;
+
+    const qIns = `
+      INSERT INTO citas (id_usuario,id_medico,cita_fecha,cita_hora,numero_orden)
+      VALUES (?, ?, STR_TO_DATE(?, '%Y-%m-%d'), STR_TO_DATE(?, '%H:%i'), ?)`;
+    conexion.query(qIns, [id_usuario, id_medico, cita_fecha, cita_hora, numero_orden], (e2) => {
+      if (e2) return res.status(500).json({ error: "Error al registrar la cita" });
+
+      const qOcupar = `
+        UPDATE horarios_medicos SET horario_estado=1
+        WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+      conexion.query(qOcupar, [id_medico, cita_fecha, cita_hora], () => {});
+
+      conexion.query("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], (e3, r3) => {
+        if (e3 || !r3.length) return res.status(404).json({ error: "Usuario no encontrado" });
+        correoConfirmacion(r3[0].usuario_correo, cita_fecha, cita_hora).catch(()=>{});
+        res.json({ mensaje: "Cita registrada correctamente", numero_orden });
+      });
+    });
+  });
+});
+
+// Actualizar cita (libera/ocupa correctamente)
+app.put("/cita/actualizar/:id", (req, res) => {
+  const { id } = req.params;
+  let { id_usuario, id_medico, cita_fecha, cita_hora, cita_estado } = req.body || {};
+  cita_fecha = toYYYYMMDD(cita_fecha);
+  if (!id_usuario || !id_medico || !cita_fecha || !cita_hora) {
+    return res.status(400).json({ mensaje: "Datos incompletos para actualizar la cita" });
+  }
+
+  conexion.query("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], (e0, r0) => {
+    if (e0 || !r0.length) return res.status(500).json({ mensaje: "No se pudo obtener el correo del usuario" });
+    const usuario_correo = r0[0].usuario_correo;
+
+    const qAnt = `
+      SELECT DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS cita_fecha,
+             TIME_FORMAT(cita_hora,'%H:%i')      AS cita_hora,
+             id_medico
+      FROM citas WHERE id_cita=?`;
+    conexion.query(qAnt, [id], (e1, r1) => {
+      if (e1 || !r1.length) return res.status(500).json({ mensaje: "Error al obtener horario anterior" });
+      const anterior = r1[0];
+
+      const qLiberar = `
+        UPDATE horarios_medicos SET horario_estado=0
+        WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+      conexion.query(qLiberar, [anterior.id_medico, anterior.cita_fecha, anterior.cita_hora], () => {});
+
+      const qUpd = `
+        UPDATE citas SET
+          id_usuario=?, id_medico=?,
+          cita_fecha=STR_TO_DATE(?, '%Y-%m-%d'),
+          cita_hora =STR_TO_DATE(?, '%H:%i'),
+          cita_estado=?
+        WHERE id_cita=?`;
+      conexion.query(qUpd, [id_usuario, id_medico, cita_fecha, cita_hora, (cita_estado ?? 1), id], (e2) => {
+        if (e2) return res.status(500).json({ mensaje: "Error al actualizar la cita" });
+        const qOcupar = `
+          UPDATE horarios_medicos SET horario_estado=1
+          WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+        conexion.query(qOcupar, [id_medico, cita_fecha, cita_hora], () => {});
+        correoActualizacion(usuario_correo, cita_fecha, cita_hora).catch(()=>{});
+        res.json({ mensaje: "Cita actualizada correctamente" });
+      });
+    });
+  });
+});
+
+// Anular por id_cita
+app.put("/cita/anular/:id_cita", (req, res) => {
+  const { id_cita } = req.params;
+  const q =
+    "SELECT DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS cita_fecha, TIME_FORMAT(cita_hora,'%H:%i') AS cita_hora, id_medico, id_usuario FROM citas WHERE id_cita=?";
+  conexion.query(q, [id_cita], (e1, r1) => {
+    if (e1 || !r1.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
+    const { cita_fecha, cita_hora, id_medico, id_usuario } = r1[0];
+    conexion.query("UPDATE citas SET cita_estado=0 WHERE id_cita=?", [id_cita], (e2) => {
+      if (e2) return res.status(500).json({ error: "Error al cancelar la cita" });
+      const qLib = `
+        UPDATE horarios_medicos SET horario_estado=0
+        WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+      conexion.query(qLib, [id_medico, cita_fecha, cita_hora], () => {
+        conexion.query("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], (e3, r3) => {
+          if (!e3 && r3.length) correoCancelacion(r3[0].usuario_correo, cita_fecha, cita_hora).catch(()=>{});
+          res.json({ mensaje: "Cita cancelada y horario liberado" });
+        });
+      });
+    });
+  });
+});
+
+// Citas por usuario
+app.get("/citas/:usuario", (req, res) => {
+  const { usuario } = req.params;
+  const consulta = `
+    SELECT c.id_cita, c.id_usuario, c.id_medico,
+           DATE_FORMAT(c.cita_fecha, '%d/%m/%Y') AS cita_fecha,
+           TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora,
+           u.usuario_nombre AS medico_nombre, u.usuario_apellido AS medico_apellido,
+           e.id_especialidad, e.especialidad_nombre, c.cita_estado
+    FROM citas c
+    INNER JOIN medicos m ON c.id_medico = m.id_medico
+    INNER JOIN usuarios u ON m.id_medico = u.id_usuario
+    INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
+    WHERE c.id_usuario = ?
+    ORDER BY c.id_cita ASC`;
+  conexion.query(consulta, [usuario], (error, rpta) => {
+    if (error) return res.status(500).json({ error: error.message });
+    const lista = rpta.map((cita, idx) => ({ ...cita, numero_orden: idx + 1 }));
+    res.json({ listaCitas: lista });
+  });
+});
+
+// KPIs por día
+app.get("/citas/por-dia", (_req, res) => {
+  const q = `
+    SELECT DATE_FORMAT(cita_fecha, '%Y-%m-%d') AS fecha, COUNT(*) AS cantidad
+    FROM citas WHERE cita_estado=1
+    GROUP BY DATE(cita_fecha) ORDER BY DATE(cita_fecha) ASC`;
+  conexion.query(q, (e, rows) => {
+    if (e) return res.status(500).json({ error: "Error en la base de datos" });
+    res.json({ listaCitas: rows.map((r) => ({ fecha: r.fecha, cantidad: r.cantidad })) });
+  });
+});
+
+/* =================== START =================== */
+app.listen(PUERTO, () => console.log("🚀 Servidor en puerto " + PUERTO));
+
+/* =================== Exports (opcional tests) =================== */
+module.exports = { toYYYYMMDD, verifyPassword, hashPassword };
