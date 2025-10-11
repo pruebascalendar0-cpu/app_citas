@@ -178,20 +178,45 @@ app.get("/especialidades", (_req, res) => {
 
 // 1) LOGIN
 app.post("/usuario/login", (req, res) => {
-  const { correo, password } = req.body || {};
-  if (!correo || !password) return res.status(400).json({ mensaje: "Correo y password son obligatorios" });
+  // Acepta múltiples nombres de campos desde el APK
+  const body = req.body || {};
+  const correo =
+    body.correo ??
+    body.email ??
+    body.usuario_correo ??
+    body.usuarioEmail ??
+    body.username; // por si acaso
+  const password =
+    body.password ??
+    body.contrasena ??
+    body.usuario_contrasena ??
+    body.pass;
 
-  const q = "SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo, usuario_contrasena_hash FROM usuarios WHERE usuario_correo = ?";
-  conexion.query(q, [correo], (err, rows) => {
+  if (!correo || !password) {
+    return res.status(400).json({ mensaje: "Correo y password son obligatorios" });
+  }
+
+  const sql = `
+    SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo, usuario_contrasena_hash
+    FROM usuarios
+    WHERE LOWER(usuario_correo) = LOWER(?)
+    LIMIT 1
+  `;
+  conexion.query(sql, [correo], (err, rows) => {
     if (err) return res.status(500).json({ mensaje: "Error en BD" });
     if (!rows || !rows[0]) return res.status(401).json({ mensaje: "Credenciales inválidas" });
 
     const u = rows[0];
-    if (!checkPassword(password, u.usuario_contrasena_hash)) {
-      return res.status(401).json({ mensaje: "Credenciales inválidas" });
-    }
-    // Respuesta tipo UsuarioDto (ajústala si tu app espera otros campos)
-    res.json({
+
+    // === verificación con tu esquema salt:sha256(salt+password)
+    const [salt, hash] = String(u.usuario_contrasena_hash || "").split(":");
+    if (!salt || !hash) return res.status(500).json({ mensaje: "Hash inválido en BD" });
+    const calc = crypto.createHash("sha256").update(salt + password).digest("hex");
+    const ok = Buffer.from(hash, "hex").equals(Buffer.from(calc, "hex"));
+    if (!ok) return res.status(401).json({ mensaje: "Credenciales inválidas" });
+
+    // Respuesta tipo UsuarioDto (ajusta nombres si tu app espera otros)
+    return res.json({
       id_usuario: u.id_usuario,
       usuario_nombre: u.usuario_nombre,
       usuario_apellido: u.usuario_apellido,
