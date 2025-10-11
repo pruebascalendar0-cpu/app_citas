@@ -267,24 +267,44 @@ app.post("/usuario/registrar", (req, res) => {
 });
 
 // Actualizar (solo nombre, apellido, correo)
-// === Editar usuario: solo nombre, apellido, correo ===
+// === Editar usuario: solo nombre, apellido, correo (con logs) ===
 app.put("/usuario/actualizar/:id", (req, res) => {
   const { id } = req.params;
   const { usuario_nombre, usuario_apellido, usuario_correo } = req.body || {};
+  console.log(`[usuario/actualizar] -> id=${id}`, { usuario_nombre, usuario_apellido, usuario_correo });
 
   if (!usuario_nombre || !usuario_apellido || !usuario_correo)
     return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
 
-  const qVer = "SELECT 1 FROM usuarios WHERE usuario_correo=? AND id_usuario<>?";
+  const qVer = `
+    SELECT id_usuario FROM usuarios 
+    WHERE LOWER(usuario_correo)=LOWER(?) AND id_usuario<>? 
+    LIMIT 1
+  `;
   conexion.query(qVer, [usuario_correo, id], (e, r) => {
-    if (e) return res.status(500).json({ mensaje: "Error al verificar correo" });
+    if (e) {
+      console.error("[usuario/actualizar] verificación ERROR:", e.message);
+      return res.status(500).json({ mensaje: "Error al verificar correo" });
+    }
     if (r.length) return res.status(409).json({ mensaje: "El correo ya está en uso por otro usuario" });
 
-    const qUpd = "UPDATE usuarios SET usuario_nombre=?, usuario_apellido=?, usuario_correo=? WHERE id_usuario=?";
-    conexion.query(qUpd, [usuario_nombre, usuario_apellido, usuario_correo, id], (e2) =>
-      e2 ? res.status(500).json({ mensaje: "Error al actualizar usuario" })
-         : res.json({ mensaje: "Usuario actualizado correctamente" })
-    );
+    const qUpd = `
+      UPDATE usuarios 
+      SET usuario_nombre=?, usuario_apellido=?, usuario_correo=? 
+      WHERE id_usuario=?
+    `;
+    conexion.query(qUpd, [usuario_nombre, usuario_apellido, usuario_correo, id], (e2, r2) => {
+      if (e2) {
+        console.error("[usuario/actualizar] UPDATE ERROR:", e2.message);
+        return res.status(500).json({ mensaje: "Error al actualizar usuario" });
+      }
+      console.log(`[usuario/actualizar] <- affectedRows=${r2.affectedRows} changedRows=${r2.changedRows}`);
+      // changedRows=0 puede significar que enviaste los mismos valores
+      res.json({ 
+        mensaje: r2.changedRows ? "Usuario actualizado correctamente" : "No hubo cambios",
+        changed: !!r2.changedRows
+      });
+    });
   });
 });
 
@@ -451,6 +471,37 @@ app.put("/horario/editar/:id_medico/:fecha/:hora", (req, res) => {
 });
 
 /* ============ CITAS ============ */
+
+// Alias claro: /citas/usuario/:id  (igual que /citas/:usuario pero con logs explícitos)
+app.get("/citas/usuario/:id", (req, res) => {
+  const id = req.params.id;
+  console.log(`[citas/usuario] -> id=${id}`);
+
+  const consulta = `
+    SELECT c.id_cita, c.id_usuario, c.id_medico,
+           DATE_FORMAT(c.cita_fecha,'%d/%m/%Y') AS cita_fecha,   -- para la tarjeta
+           DATE_FORMAT(c.cita_fecha,'%Y-%m-%d') AS fecha_iso,    -- si la app lo necesita
+           TIME_FORMAT(c.cita_hora,'%H:%i')     AS cita_hora,
+           u.usuario_nombre AS medico_nombre, u.usuario_apellido AS medico_apellido,
+           e.id_especialidad, e.especialidad_nombre, c.cita_estado
+    FROM citas c
+    INNER JOIN medicos m ON c.id_medico = m.id_medico
+    INNER JOIN usuarios u ON m.id_medico = u.id_usuario
+    INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
+    WHERE c.id_usuario = ?
+    ORDER BY c.id_cita ASC
+  `;
+  conexion.query(consulta, [id], (error, rows) => {
+    if (error) {
+      console.error("[citas/usuario] DB ERROR:", error.message);
+      return res.status(500).json({ error: error.message });
+    }
+    const lista = rows.map((c, i) => ({ ...c, numero_orden: i + 1 }));
+    console.log(`[citas/usuario] <- ${lista.length} citas (primera:`, lista[0], ")");
+    res.json({ listaCitas: lista });
+  });
+});
+
 app.post("/cita/agregar", (req, res) => {
   let { id_usuario, id_medico, cita_fecha, cita_hora } = req.body || {};
   cita_fecha = toYYYYMMDD(cita_fecha);
@@ -562,40 +613,46 @@ app.put("/cita/anular/:id_usuario/:numero_orden", (req, res) => {
 
 // GET /cita/usuario/:id_usuario/orden/:numero_orden
 // === Buscar 1 cita por (id_usuario, numero_orden) con fecha ISO ===
+// === Buscar 1 cita por (id_usuario, numero_orden) con campos EXACTOS ===
 app.get("/cita/usuario/:id_usuario/orden/:numero_orden", (req, res) => {
   const { id_usuario, numero_orden } = req.params;
+  console.log(`[cita/usuario/orden] -> u=${id_usuario} n=${numero_orden}`);
 
   const sql = `
     SELECT 
-      c.id_cita         AS IdCita,
+      c.id_cita AS IdCita,
       CONCAT(u.usuario_nombre,' ',u.usuario_apellido) AS UsuarioCita,
       e.especialidad_nombre AS Especialidad,
       CONCAT(mu.usuario_nombre,' ',mu.usuario_apellido) AS Medico,
-      DATE_FORMAT(c.cita_fecha,'%Y-%m-%d') AS FechaISO,       -- <- ISO para Android
-      TIME_FORMAT(c.cita_hora,'%H:%i')       AS Hora,         -- <- HH:mm
+      DATE_FORMAT(c.cita_fecha,'%Y-%m-%d') AS FechaCita,   -- <- YYYY-MM-DD
+      TIME_FORMAT(c.cita_hora,'%H:%i')       AS HoraCita,   -- <- HH:mm
       c.cita_estado
     FROM citas c
-      INNER JOIN usuarios u  ON u.id_usuario = c.id_usuario
-      INNER JOIN medicos m   ON m.id_medico  = c.id_medico
-      INNER JOIN usuarios mu ON mu.id_usuario= m.id_medico
-      INNER JOIN especialidades e ON e.id_especialidad = m.id_especialidad
-    WHERE c.id_usuario = ? AND c.numero_orden = ?
-    LIMIT 1;
+    INNER JOIN usuarios u  ON u.id_usuario = c.id_usuario
+    INNER JOIN medicos m   ON m.id_medico  = c.id_medico
+    INNER JOIN usuarios mu ON mu.id_usuario= m.id_medico
+    INNER JOIN especialidades e ON e.id_especialidad = m.id_especialidad
+    WHERE c.id_usuario=? AND c.numero_orden=?
+    LIMIT 1
   `;
 
   conexion.query(sql, [id_usuario, numero_orden], (err, rows) => {
-    if (err) return res.status(500).json({ error: "Error en la base de datos" });
+    if (err) {
+      console.error("[cita/usuario/orden] DB ERROR:", err.message);
+      return res.status(500).json({ error: "Error en la base de datos" });
+    }
     if (!rows.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
 
     const r = rows[0];
+    console.log("[cita/usuario/orden] <-", r);
     res.json({
       IdCita: r.IdCita,
       UsuarioCita: r.UsuarioCita,
       Especialidad: r.Especialidad,
       Medico: r.Medico,
-      FechaISO: r.FechaISO,  // <- usa este campo en la app
-      Hora: r.Hora,
-      EstadoCita: r.cita_estado === 1 ? "Confirmada" : "Cancelada"
+      FechaCita: r.FechaCita,   // <- usa este campo en Android
+      HoraCita:  r.HoraCita,
+      EstadoCita: r.cita_estado === 1 ? "Confirmada" : "Cancelada",
     });
   });
 });
@@ -694,6 +751,13 @@ const getCitasUsuarioHandler = (req, res) => {
   );
 };
 app.get("/citas/:usuario", getCitasUsuarioHandler);
+
+// (opcional) Si mantienes /citas/:usuario, deja este log para detectar 0
+app.get("/citas/:usuario", (req, res, next) => {
+  const u = req.params.usuario;
+  if (u === "0") console.warn("[/citas/:usuario] ⚠️ Están llamando con usuario=0 (no mostrará citas del paciente)");
+  return next();
+});
 
 /* ============ START ============ */
 app.listen(PUERTO, () => console.log("🚀 Servidor en puerto " + PUERTO));
