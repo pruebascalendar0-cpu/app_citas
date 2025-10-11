@@ -17,12 +17,32 @@ app.use((req, res, next) => {
   next();
 });
 
-function toYYYYMMDD(v) {
-  if (!v) return v;
-  const s = String(v);
+function encodeWord(s) {
+  const b64 = Buffer.from(String(s), "utf8").toString("base64");
+  return `=?UTF-8?B?${b64}?=`;
+}
+function encodeFrom(addr) {
+  const m = String(addr || "").match(/^(.*)<([^>]+)>$/);
+  if (!m) return addr;
+  const name = m[1].trim().replace(/^"|"$/g, "");
+  const email = m[2].trim();
+  return `"${encodeWord(name)}" <${email}>`;
+}
+
+function toYYYYMMDD(input) {
+  if (!input) return input;
+  let s = String(input).trim();
+  s = s.replace(/\//g, "-");
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  const z = s.includes("T") ? s.slice(0, 10) : s;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(z)) return z;
+  if (s.includes("T")) {
+    const mins = Number(process.env.TZ_OFFSET_MINUTES ?? -300);
+    const d = new Date(s);
+    const d2 = new Date(d.getTime() + mins * 60 * 1000);
+    const y = d2.getUTCFullYear();
+    const m = String(d2.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(d2.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
   const d = new Date(s);
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -40,16 +60,16 @@ function verifyPassword(plain, stored) {
   const t = crypto.createHash("sha256").update(salt + String(plain)).digest("hex");
   return t.toLowerCase() === String(h || "").toLowerCase();
 }
-function b64url(s) {
-  return Buffer.from(s).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
 function toPlain(html) {
-  return String(html || "").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  return String(html || "").replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ").trim();
 }
-function sanitizeHeader(s) {
-  return String(s || "").replace(/\r|\n/g, " ").replace(/\s+/g, " ").trim();
-}
-const FROM = process.env.EMAIL_FROM || `Clinica Salud Total <${process.env.EMAIL_USER || ""}>`;
+function sanitizeHeader(s) { return String(s || "").replace(/\r|\n/g, " ").replace(/\s+/g, " ").trim(); }
+function b64url(s) { return Buffer.from(s).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,""); }
+
+const FROM_RAW = process.env.EMAIL_FROM || `Clínica Salud Total <${process.env.EMAIL_USER || ""}>`;
+const FROM = encodeFrom(FROM_RAW);
 const REPLY_TO = process.env.REPLY_TO || process.env.EMAIL_USER || "";
 
 async function sendViaGmailAPI({ to, subject, html, text, headers = {} }) {
@@ -57,12 +77,12 @@ async function sendViaGmailAPI({ to, subject, html, text, headers = {} }) {
   oauth2.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
   await oauth2.getAccessToken();
   const gmail = google.gmail({ version: "v1", auth: oauth2 });
-  const subjEnc = `=?UTF-8?B?${Buffer.from(sanitizeHeader(subject), "utf8").toString("base64")}?=`;
+  const subj = encodeWord(sanitizeHeader(subject));
   const lines = [
     `From: ${FROM}`,
     `To: ${to}`,
     `Reply-To: ${REPLY_TO}`,
-    `Subject: ${subjEnc}`,
+    `Subject: ${subj}`,
     `MIME-Version: 1.0`,
     `Content-Type: text/html; charset=UTF-8`,
     ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`),
@@ -80,21 +100,10 @@ async function sendViaSMTP({ to, subject, html, text, headers = {} }) {
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || "false") === "true",
     auth: process.env.EMAIL_PASSWORD ? { user: process.env.EMAIL_USER, pass: (process.env.EMAIL_PASSWORD || "").replace(/\s+/g, "") } : undefined,
-    pool: true,
-    maxConnections: 3,
-    maxMessages: 50,
-    connectionTimeout: 30000,
-    socketTimeout: 45000,
-    family: 4,
+    pool: true, maxConnections: 3, maxMessages: 50, connectionTimeout: 30000, socketTimeout: 45000, family: 4,
   });
   const info = await transporter.sendMail({
-    from: FROM,
-    to,
-    subject: sanitizeHeader(subject),
-    html,
-    text: text || toPlain(html),
-    replyTo: REPLY_TO,
-    headers,
+    from: FROM, to, subject: sanitizeHeader(subject), html, text: text || toPlain(html), replyTo: REPLY_TO, headers,
   });
   return info.messageId;
 }
@@ -106,18 +115,15 @@ async function enviarMail({ to, subject, html, text, category }) {
     if (process.env.UNSUB_URL) arr.push(`<${process.env.UNSUB_URL}>`);
     headers["List-Unsubscribe"] = arr.join(", ");
   }
-  if (String(process.env.MAIL_STRATEGY || "").toUpperCase() === "GMAIL_API") return await sendViaGmailAPI({ to, subject, html, text, headers });
-  return await sendViaSMTP({ to, subject, html, text, headers });
+  const useGmail = String(process.env.MAIL_STRATEGY || "").toUpperCase() === "GMAIL_API";
+  return useGmail ? sendViaGmailAPI({ to, subject, html, text, headers }) : sendViaSMTP({ to, subject, html, text, headers });
 }
 const wrap = (inner) =>
   `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;line-height:1.5;color:#222;max-width:560px">${inner}<hr style="border:none;border-top:1px solid #eee;margin:16px 0" /><div style="font-size:12px;color:#777">Clínica Salud Total · Mensaje automático.</div></div>`;
 
 const db = mysql.createConnection({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
+  host: process.env.DB_HOST, port: process.env.DB_PORT, database: process.env.DB_NAME,
+  user: process.env.DB_USER, password: process.env.DB_PASSWORD,
 });
 db.connect((err) => {
   if (err) throw err;
@@ -131,7 +137,8 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 app.post("/usuario/login", (req, res) => {
   const correo = String(req.body?.usuario_correo || req.body?.email || "").trim();
   const pass = String(req.body?.password || "");
-  const q = "SELECT id_usuario,usuario_nombre,usuario_apellido,usuario_correo,usuario_tipo,usuario_contrasena_hash FROM usuarios WHERE usuario_correo=?";
+  const q = `SELECT id_usuario,usuario_nombre,usuario_apellido,usuario_correo,usuario_tipo,usuario_contrasena_hash
+             FROM usuarios WHERE usuario_correo=?`;
   db.query(q, [correo], (e, r) => {
     if (e) return res.status(500).json({ mensaje: "Error en la base de datos" });
     if (!r.length) return res.status(404).json({ mensaje: "Correo no registrado" });
@@ -151,6 +158,11 @@ app.get("/usuario/:correo", (req, res) => {
   });
 });
 
+app.get("/usuarios", (_, res) => {
+  const sql = "SELECT id_usuario,usuario_dni,usuario_nombre,usuario_apellido,usuario_correo,usuario_tipo FROM usuarios ORDER BY id_usuario ASC";
+  db.query(sql, (e, r) => e ? res.status(500).json({ error: "DB" }) : res.json({ listaUsuarios: r }));
+});
+
 app.post("/usuario/agregar", (req, res) => {
   const b = req.body || {};
   if (!/^\d{8}$/.test(String(b.usuario_dni || ""))) return res.status(400).json({ mensaje: "DNI inválido" });
@@ -158,14 +170,11 @@ app.post("/usuario/agregar", (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(b.usuario_correo || ""))) return res.status(400).json({ mensaje: "Correo inválido" });
   if (!b.usuario_contrasena || String(b.usuario_contrasena).length < 6) return res.status(400).json({ mensaje: "Contraseña mínima 6 caracteres" });
   const row = {
-    usuario_dni: b.usuario_dni,
-    usuario_nombre: b.usuario_nombre,
-    usuario_apellido: b.usuario_apellido,
-    usuario_correo: b.usuario_correo,
-    usuario_contrasena_hash: hashPassword(b.usuario_contrasena),
+    usuario_dni: b.usuario_dni, usuario_nombre: b.usuario_nombre, usuario_apellido: b.usuario_apellido,
+    usuario_correo: b.usuario_correo, usuario_contrasena_hash: hashPassword(b.usuario_contrasena),
     usuario_tipo: Number(b.usuario_tipo ?? 1),
   };
-  db.query("INSERT INTO usuarios SET ?", row, (e) => {
+  db.query("INSERT INTO usuarios SET ?", row, (e, r) => {
     if (e) {
       if (e.code === "ER_DUP_ENTRY") {
         if (e.sqlMessage?.includes("usuario_dni")) return res.status(400).json({ mensaje: "DNI ya registrado" });
@@ -201,11 +210,11 @@ app.post("/usuario/registrar", (req, res) => {
     const id_especialidad = Number(b.id_especialidad || b.especialidad || 0);
     if (row.usuario_tipo === 2 && id_especialidad) {
       db.query("INSERT INTO medicos(id_medico,id_especialidad) VALUES(?,?)", [id_usuario, id_especialidad], (e2) => {
-        if (e2) return res.status(500).json({ mensaje: "Error al vincular especialidad" });
-        res.json({ ok: true, id_usuario });
+        if (e2) return res.status(201).json({ mensaje: "Usuario creado, pero no se pudo asignar especialidad", id_usuario });
+        res.status(201).json({ mensaje: "Médico registrado correctamente", id_usuario });
       });
     } else {
-      res.json({ ok: true, id_usuario });
+      res.status(201).json({ mensaje: "Usuario registrado correctamente", id_usuario });
     }
   });
 });
@@ -214,24 +223,18 @@ app.put("/usuario/actualizar/:id", (req, res) => {
   const id = Number(req.params.id);
   const b = req.body || {};
   const up = {
-    usuario_dni: b.usuario_dni,
-    usuario_nombre: b.usuario_nombre,
-    usuario_apellido: b.usuario_apellido,
-    usuario_correo: b.usuario_correo,
-    usuario_tipo: b.usuario_tipo,
+    usuario_dni: b.usuario_dni, usuario_nombre: b.usuario_nombre, usuario_apellido: b.usuario_apellido,
+    usuario_correo: b.usuario_correo, usuario_tipo: b.usuario_tipo,
   };
-  db.query("UPDATE usuarios SET ? WHERE id_usuario=?", [up, id], (e, r) => {
-    if (e) return res.status(500).json({ mensaje: "Error al actualizar" });
-    if (!r.affectedRows) return res.status(404).json({ mensaje: "No encontrado" });
-    res.json({ mensaje: "Actualizado" });
-  });
-});
-
-app.get("/usuarios", (_, res) => {
-  const sql = "SELECT id_usuario, usuario_dni, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo FROM usuarios ORDER BY id_usuario ASC";
-  db.query(sql, (e, r) => {
-    if (e) return res.status(500).json({ error: "DB" });
-    res.json({ listaUsuarios: r });
+  const qDup = "SELECT id_usuario FROM usuarios WHERE (usuario_correo=? OR usuario_dni=?) AND id_usuario<>?";
+  db.query(qDup, [up.usuario_correo, up.usuario_dni, id], (e1, r1) => {
+    if (e1) return res.status(500).json({ mensaje: "Error al validar duplicados" });
+    if (r1.length) return res.status(409).json({ mensaje: "Correo o DNI ya en uso" });
+    db.query("UPDATE usuarios SET ? WHERE id_usuario=?", [up, id], (e, r) => {
+      if (e) return res.status(500).json({ mensaje: "Error al actualizar" });
+      if (!r.affectedRows) return res.status(404).json({ mensaje: "No encontrado" });
+      res.json({ mensaje: "Usuario actualizado correctamente" });
+    });
   });
 });
 
@@ -285,17 +288,14 @@ app.post("/usuario/reset/cambiar", (req, res) => {
 });
 
 app.get("/especialidades", (_, res) => {
-  db.query("SELECT * FROM especialidades", (e, r) => {
-    if (e) return res.status(500).json({ error: e.message });
-    res.json({ listaEspecialidades: r });
-  });
+  db.query("SELECT * FROM especialidades", (e, r) => e ? res.status(500).json({ error: e.message }) : res.json({ listaEspecialidades: r }));
 });
 app.post("/especialidad/agregar", (req, res) => {
   const nombre = String(req.body?.especialidad_nombre || "").trim();
   if (!nombre) return res.status(400).json({ mensaje: "Nombre requerido" });
   db.query("INSERT INTO especialidades (especialidad_nombre) VALUES (?)", [nombre], (e) => {
     if (e) return res.status(500).json({ mensaje: "Error al agregar" });
-    res.json("Especialidad agregada");
+    res.json("Especialidad registrada");
   });
 });
 app.put("/especialidad/actualizar/:id", (req, res) => {
@@ -305,7 +305,7 @@ app.put("/especialidad/actualizar/:id", (req, res) => {
   db.query("UPDATE especialidades SET especialidad_nombre=? WHERE id_especialidad=?", [nombre, id], (e, r) => {
     if (e) return res.status(500).json({ mensaje: "Error al actualizar" });
     if (!r.affectedRows) return res.status(404).json({ mensaje: "No encontrado" });
-    res.json({ mensaje: "Actualizado" });
+    res.json({ mensaje: "Especialidad actualizada correctamente" });
   });
 });
 app.get("/medico/:id_medico/especialidades", (req, res) => {
@@ -313,10 +313,7 @@ app.get("/medico/:id_medico/especialidades", (req, res) => {
   const q = `SELECT e.id_especialidad, e.especialidad_nombre
              FROM medicos m INNER JOIN especialidades e ON m.id_especialidad=e.id_especialidad
              WHERE m.id_medico=?`;
-  db.query(q, [id], (e, r) => {
-    if (e) return res.status(500).json({ error: "DB" });
-    res.json({ listaEspecialidades: r });
-  });
+  db.query(q, [id], (e, r) => e ? res.status(500).json({ error: "DB" }) : res.json({ listaEspecialidades: r }));
 });
 
 app.get("/horarios/:parametro", (req, res) => {
@@ -331,10 +328,7 @@ app.get("/horarios/:parametro", (req, res) => {
     INNER JOIN especialidades e ON h.id_especialidad=e.id_especialidad
     WHERE h.horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND h.id_especialidad=? AND h.horario_estado=0
     ORDER BY h.horario_hora ASC`;
-  db.query(q, [fecha, idEsp], (e, r) => {
-    if (e) return res.status(500).json({ error: e.message });
-    res.json({ listaHorarios: r });
-  });
+  db.query(q, [fecha, idEsp], (e, r) => e ? res.status(500).json({ error: e.message }) : res.json({ listaHorarios: r }));
 });
 app.get("/horarios/disponibles/:id_medico/:fecha/:id_especialidad", (req, res) => {
   const id_medico = Number(req.params.id_medico);
@@ -354,10 +348,7 @@ app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", (req, res) =
   const fecha = toYYYYMMDD(req.params.fecha);
   const id_especialidad = Number(req.params.id_especialidad);
   const q = `SELECT TIME_FORMAT(horario_hora,'%H:%i') AS horario_hora FROM horarios_medicos WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND id_especialidad=? AND horario_estado=0 ORDER BY horario_hora ASC`;
-  db.query(q, [id_medico, fecha, id_especialidad], (e, r) => {
-    if (e) return res.status(500).json({ error: "DB" });
-    res.json({ horarios: r.map((x) => x.horario_hora) });
-  });
+  db.query(q, [id_medico, fecha, id_especialidad], (e, r) => e ? res.status(500).json({ error: "DB" }) : res.json({ horarios: r.map((x) => x.horario_hora) }));
 });
 app.post("/horario/registrar", (req, res) => {
   const b = req.body || {};
@@ -377,18 +368,14 @@ app.post("/horario/registrar", (req, res) => {
 app.put("/horario/actualizar/:id_horario", (req, res) => {
   const id = Number(req.params.id_horario);
   const b = req.body || {};
-  const set = [];
-  const vals = [];
+  const set = [], vals = [];
   if (b.horario_estado != null) { set.push("horario_estado=?"); vals.push(Number(b.horario_estado)); }
   if (b.horario_fecha) { set.push("horario_fecha=STR_TO_DATE(?, '%Y-%m-%d')"); vals.push(toYYYYMMDD(b.horario_fecha)); }
   if (b.horario_hora) { set.push("horario_hora=STR_TO_DATE(?, '%H:%i')"); vals.push(b.horario_hora); }
   if (b.id_especialidad) { set.push("id_especialidad=?"); vals.push(Number(b.id_especialidad)); }
   if (!set.length) return res.status(400).json({ mensaje: "Sin cambios" });
   const q = `UPDATE horarios_medicos SET ${set.join(", ")} WHERE id_horario=?`;
-  db.query(q, [...vals, id], (e, r) => {
-    if (e) return res.status(500).json({ mensaje: "Error al actualizar" });
-    res.json({ mensaje: "Horario actualizado" });
-  });
+  db.query(q, [...vals, id], (e, r) => e ? res.status(500).json({ mensaje: "Error al actualizar" }) : res.json({ mensaje: "Horario actualizado" }));
 });
 app.put("/horario/editar/:id_medico/:fecha/:hora", (req, res) => {
   const id_medico = Number(req.params.id_medico);
@@ -434,6 +421,7 @@ app.post("/cita/agregar", (req, res) => {
     });
   });
 });
+
 app.put("/cita/actualizar/:id", (req, res) => {
   const id = Number(req.params.id);
   let { id_usuario, id_medico, cita_fecha, cita_hora, cita_estado } = req.body || {};
@@ -456,10 +444,12 @@ app.put("/cita/actualizar/:id", (req, res) => {
     });
   });
 });
+
 app.put("/cita/anular/:id_usuario/:numero_orden", (req, res) => {
   const id_usuario = Number(req.params.id_usuario);
   const numero_orden = Number(req.params.numero_orden);
-  const q = `SELECT id_cita,id_medico,DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS cita_fecha,TIME_FORMAT(cita_hora,'%H:%i') AS cita_hora FROM citas WHERE id_usuario=? AND numero_orden=? AND cita_estado=1`;
+  const q = `SELECT id_cita,id_medico,DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS cita_fecha,TIME_FORMAT(cita_hora,'%H:%i') AS cita_hora
+             FROM citas WHERE id_usuario=? AND numero_orden=? AND cita_estado=1`;
   db.query(q, [id_usuario, numero_orden], (e1, r1) => {
     if (e1 || !r1.length) return res.status(404).json({ mensaje: "No existe esa cita" });
     const c = r1[0];
@@ -473,10 +463,12 @@ app.put("/cita/anular/:id_usuario/:numero_orden", (req, res) => {
     });
   });
 });
+
 app.get("/cita/usuario/:id_usuario/orden/:numero_orden", (req, res) => {
   const id_usuario = Number(req.params.id_usuario);
   const numero_orden = Number(req.params.numero_orden);
-  const q = `SELECT c.*,DATE_FORMAT(c.cita_fecha,'%Y-%m-%d') AS cita_fecha_fmt,TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora_fmt FROM citas c WHERE c.id_usuario=? AND c.numero_orden=?`;
+  const q = `SELECT c.*,DATE_FORMAT(c.cita_fecha,'%Y-%m-%d') AS cita_fecha_fmt,TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora_fmt
+             FROM citas c WHERE c.id_usuario=? AND c.numero_orden=?`;
   db.query(q, [id_usuario, numero_orden], (e, r) => {
     if (e) return res.status(500).json({ mensaje: "DB" });
     if (!r.length) return res.status(404).json({ mensaje: "No existe esa cita" });
@@ -484,46 +476,38 @@ app.get("/cita/usuario/:id_usuario/orden/:numero_orden", (req, res) => {
     res.json({ id_cita: c.id_cita, id_usuario: c.id_usuario, id_medico: c.id_medico, cita_fecha: c.cita_fecha_fmt, cita_hora: c.cita_hora_fmt, numero_orden: c.numero_orden, cita_estado: c.cita_estado });
   });
 });
-app.put("/cita/estado/:id_cita", (req, res) => {
-  const id_cita = Number(req.params.id_cita);
-  const estado = Number(req.body?.cita_estado ?? 1);
-  db.query("UPDATE citas SET cita_estado=? WHERE id_cita=?", [estado, id_cita], (e, r) => {
-    if (e) return res.status(500).json({ mensaje: "DB" });
-    if (!r.affectedRows) return res.status(404).json({ mensaje: "No encontrado" });
-    res.json({ mensaje: "Estado actualizado" });
-  });
-});
+
 app.get("/citas/:usuario", (req, res) => {
   const usuario = Number(req.params.usuario);
-  const q = `SELECT c.id_cita, c.id_usuario, c.id_medico, DATE_FORMAT(c.cita_fecha,'%d/%m/%Y') AS cita_fecha, TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora, u.usuario_nombre AS medico_nombre, u.usuario_apellido AS medico_apellido, e.id_especialidad, e.especialidad_nombre, c.cita_estado
+  const q = `SELECT c.id_cita, c.id_usuario, c.id_medico,
+                    DATE_FORMAT(c.cita_fecha,'%d/%m/%Y') AS cita_fecha,
+                    TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora,
+                    u.usuario_nombre AS medico_nombre, u.usuario_apellido AS medico_apellido,
+                    e.id_especialidad, e.especialidad_nombre, c.cita_estado
              FROM citas c
              INNER JOIN medicos m ON c.id_medico=m.id_medico
              INNER JOIN usuarios u ON m.id_medico=u.id_usuario
              INNER JOIN especialidades e ON m.id_especialidad=e.id_especialidad
              WHERE c.id_usuario=? ORDER BY c.id_cita ASC`;
-  db.query(q, [usuario], (e, r) => {
-    if (e) return res.status(500).json({ error: e.message });
-    res.json({ listaCitas: r.map((x, i) => ({ ...x, numero_orden: i + 1 })) });
-  });
+  db.query(q, [usuario], (e, r) => e ? res.status(500).json({ error: e.message }) : res.json({ listaCitas: r.map((x,i)=>({ ...x, numero_orden: i+1 })) }));
 });
+
 app.get("/citas/medico/:id_medico", (req, res) => {
   const id = Number(req.params.id_medico);
-  const q = `SELECT c.id_cita,c.id_usuario,c.id_medico,DATE_FORMAT(c.cita_fecha,'%d/%m/%Y') AS cita_fecha,TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora,c.cita_estado,u.usuario_nombre AS paciente_nombre,u.usuario_apellido AS paciente_apellido
+  const q = `SELECT c.id_cita,c.id_usuario,c.id_medico,
+                    DATE_FORMAT(c.cita_fecha,'%d/%m/%Y') AS cita_fecha,
+                    TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora,
+                    c.cita_estado,u.usuario_nombre AS paciente_nombre,u.usuario_apellido AS paciente_apellido
              FROM citas c INNER JOIN usuarios u ON c.id_usuario=u.id_usuario
              WHERE c.id_medico=? ORDER BY c.cita_fecha,c.cita_hora`;
-  db.query(q, [id], (e, r) => {
-    if (e) return res.status(500).json({ error: "DB" });
-    res.json({ listaCitas: r });
-  });
+  db.query(q, [id], (e, r) => e ? res.status(500).json({ error: "DB" }) : res.json({ listaCitas: r }));
 });
+
 app.get("/citas/por-dia", (_, res) => {
-  const q = `SELECT DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS fecha, COUNT(*) AS cantidad FROM citas WHERE cita_estado=1 GROUP BY DATE(cita_fecha) ORDER BY DATE(cita_fecha) ASC`;
-  db.query(q, (e, r) => {
-    if (e) return res.status(500).json({ error: "DB" });
-    res.json({ listaCitas: r.map((x) => ({ fecha: x.fecha, cantidad: x.cantidad })) });
-  });
+  const q = `SELECT DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS fecha, COUNT(*) AS cantidad
+             FROM citas WHERE cita_estado=1 GROUP BY DATE(cita_fecha) ORDER BY DATE(cita_fecha) ASC`;
+  db.query(q, (e, r) => e ? res.status(500).json({ error: "DB" }) : res.json({ listaCitas: r.map(x => ({ fecha: x.fecha, cantidad: x.cantidad })) }));
 });
 
 app.listen(PORT, () => console.log("🚀 Servidor en puerto " + PORT));
-
 module.exports = { toYYYYMMDD, verifyPassword };
