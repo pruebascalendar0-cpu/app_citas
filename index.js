@@ -199,15 +199,28 @@ app.post("/usuario/login", (req, res) => {
 });
 
 // Registrar paciente
-app.post("/usuario/agregar", (req, res) => {
-  const { usuario_dni, usuario_nombre, usuario_apellido, usuario_correo, usuario_contrasena } = req.body || {};
-  if (!/^\d{8}$/.test(usuario_dni || "")) return res.status(400).json({ mensaje: "DNI inválido (8 dígitos)" });
-  if (!usuario_nombre || !usuario_apellido) return res.status(400).json({ mensaje: "Nombre y apellido obligatorios" });
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(usuario_correo || "")) return res.status(400).json({ mensaje: "Correo inválido" });
-  if (!usuario_contrasena || usuario_contrasena.length < 6) return res.status(400).json({ mensaje: "La contraseña debe tener al menos 6 caracteres." });
+app.post("/usuario/registrar", (req, res) => {
+  const {
+    usuario_nombre, usuario_apellido, usuario_correo,
+    usuario_dni, usuario_contrasena, usuario_tipo, id_especialidad
+  } = req.body || {};
 
-  const row = { usuario_dni, usuario_nombre, usuario_apellido, usuario_correo, usuario_contrasena_hash: saltHash(usuario_contrasena), usuario_tipo: 1 };
-  conexion.query("INSERT INTO usuarios SET ?", row, (err) => {
+  if (!usuario_nombre || !usuario_apellido || !usuario_correo || !usuario_dni || !usuario_contrasena) {
+    return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
+  }
+  if (!/^\d{8}$/.test(usuario_dni)) return res.status(400).json({ mensaje: "DNI inválido (8 dígitos)" });
+
+  const row = {
+    usuario_nombre, usuario_apellido, usuario_correo, usuario_dni,
+    usuario_contrasena_hash: (function saltHash(plain) {
+      const salt = crypto.randomBytes(16).toString("hex");
+      const hash = crypto.createHash("sha256").update(salt + plain).digest("hex");
+      return `${salt}:${hash}`;
+    })(usuario_contrasena),
+    usuario_tipo: Number.isInteger(usuario_tipo) ? usuario_tipo : 1,
+  };
+
+  conexion.query("INSERT INTO usuarios SET ?", row, (err, r) => {
     if (err) {
       if (err.code === "ER_DUP_ENTRY") {
         if (err.sqlMessage?.includes("usuario_dni")) return res.status(400).json({ mensaje: "DNI ya registrado" });
@@ -215,8 +228,17 @@ app.post("/usuario/agregar", (req, res) => {
       }
       return res.status(500).json({ mensaje: "Error al registrar usuario" });
     }
-    correoBienvenida(usuario_correo, `${usuario_nombre} ${usuario_apellido}`).catch(()=>{});
-    res.json({ mensaje: "Usuario registrado correctamente." });
+    const id_usuario = r.insertId;
+    if (row.usuario_tipo === 2 && id_especialidad) {
+      conexion.query("INSERT INTO medicos (id_medico, id_especialidad) VALUES (?,?)",
+        [id_usuario, id_especialidad],
+        (e2) => {
+          if (e2) return res.status(201).json({ mensaje: "Usuario registrado, pero no se asignó especialidad", id_usuario });
+          res.status(201).json({ mensaje: "Médico registrado correctamente", id_usuario });
+        });
+    } else {
+      res.status(201).json({ mensaje: "Usuario registrado correctamente", id_usuario });
+    }
   });
 });
 
@@ -314,6 +336,32 @@ app.post("/usuario/reset/cambiar", (req, res) => {
 /* ============ ESPECIALIDADES / MÉDICOS / HORARIOS ============ */
 app.get("/especialidades", (_, res) => {
   conexion.query("SELECT * FROM especialidades", (e, r) => e ? res.status(500).json({ error: e.message }) : res.json({ listaEspecialidades: r }));
+});
+
+// POST /especialidad/agregar  (compat con tu frontend)
+app.post("/especialidad/agregar", (req, res) => {
+  const { especialidad_nombre } = req.body || {};
+  if (!especialidad_nombre) return res.status(400).json({ error: "Nombre requerido" });
+
+  const sql = "INSERT INTO especialidades (especialidad_nombre) VALUES (?)";
+  conexion.query(sql, [especialidad_nombre], (err, r) => {
+    if (err) return res.status(500).json({ error: "Error al guardar especialidad" });
+    res.status(201).json("Especialidad registrada");
+  });
+});
+
+// PUT /especialidad/actualizar/:id  (compat con tu frontend)
+app.put("/especialidad/actualizar/:id", (req, res) => {
+  const { id } = req.params;
+  const { especialidad_nombre } = req.body || {};
+  if (!especialidad_nombre) return res.status(400).json({ mensaje: "Nombre requerido" });
+
+  const sql = "UPDATE especialidades SET especialidad_nombre=? WHERE id_especialidad=?";
+  conexion.query(sql, [especialidad_nombre, id], (err, r) => {
+    if (err) return res.status(500).json({ error: "Error al actualizar especialidad" });
+    if (!r.affectedRows) return res.status(404).json({ mensaje: "Especialidad no encontrada" });
+    res.json({ mensaje: "Especialidad actualizada correctamente" });
+  });
 });
 
 // horarios por "fecha&especialidad"
@@ -445,6 +493,58 @@ app.put("/cita/anular/:id_cita", (req, res) => {
   });
 });
 
+// GET /cita/usuario/:id_usuario/orden/:numero_orden
+app.get("/cita/usuario/:id_usuario/orden/:numero_orden", (req, res) => {
+  const { id_usuario, numero_orden } = req.params;
+
+  const consulta = `
+    SELECT 
+      cit.id_cita AS IdCita,
+      CONCAT(us.usuario_nombre,' ',us.usuario_apellido) AS UsuarioCita,
+      esp.especialidad_nombre AS Especialidad,
+      CONCAT(mu.usuario_nombre,' ',mu.usuario_apellido) AS Medico,
+      DATE_FORMAT(cit.cita_fecha,'%Y-%m-%d') AS FechaCita,
+      TIME_FORMAT(cit.cita_hora,'%H:%i') AS HoraCita,
+      CASE WHEN cit.cita_estado=1 THEN 'Confirmada'
+           WHEN cit.cita_estado=0 THEN 'Cancelada'
+           ELSE 'Desconocido' END AS EstadoCita
+    FROM citas cit
+    INNER JOIN usuarios us ON us.id_usuario = cit.id_usuario
+    INNER JOIN medicos m ON m.id_medico = cit.id_medico
+    INNER JOIN usuarios mu ON m.id_medico = mu.id_usuario
+    INNER JOIN especialidades esp ON esp.id_especialidad = m.id_especialidad
+    WHERE cit.id_usuario = ? AND cit.numero_orden = ?
+    LIMIT 1`;
+  conexion.query(consulta, [id_usuario, numero_orden], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error en la base de datos" });
+    if (!rows.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
+    res.json(rows[0]);
+  });
+});
+
+// GET /citamedica/:id_cita
+app.get("/citamedica/:id_cita", (req, res) => {
+  const { id_cita } = req.params;
+  const consulta = `
+    SELECT cit.id_cita AS IdCita,
+           CONCAT(us.usuario_nombre,' ',us.usuario_apellido) AS UsuarioCita,
+           esp.especialidad_nombre AS Especialidad,
+           CONCAT(med.usuario_nombre,' ',med.usuario_apellido) AS Medico,
+           DATE_FORMAT(cit.cita_fecha,'%Y-%m-%d') AS FechaCita,
+           TIME_FORMAT(cit.cita_hora,'%H:%i') AS HoraCita
+    FROM citas cit
+    INNER JOIN usuarios us  ON us.id_usuario = cit.id_usuario
+    INNER JOIN medicos m    ON m.id_medico   = cit.id_medico
+    INNER JOIN usuarios med ON med.id_usuario= m.id_medico
+    INNER JOIN especialidades esp ON esp.id_especialidad = m.id_especialidad
+    WHERE cit.id_cita = ?`;
+  conexion.query(consulta, [id_cita], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error en la base de datos" });
+    if (!rows.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
+    res.json(rows[0]);
+  });
+});
+
 // Citas por usuario
 app.get("/citas/:usuario", (req, res) => {
   const { usuario } = req.params;
@@ -468,6 +568,52 @@ app.get("/citas/por-dia", (_, res) => {
   const q = `SELECT DATE_FORMAT(cita_fecha, '%Y-%m-%d') AS fecha, COUNT(*) AS cantidad FROM citas WHERE cita_estado=1 GROUP BY DATE(cita_fecha) ORDER BY DATE(cita_fecha) ASC`;
   conexion.query(q, (e, rows) => e ? res.status(500).json({ error: "Error en la base de datos" }) : res.json({ listaCitas: rows.map(r => ({ fecha: r.fecha, cantidad: r.cantidad })) }));
 });
+
+// GET /citas  -> todas para admin
+app.get("/citas", (_, res) => {
+  const q = `
+  SELECT 
+    ROW_NUMBER() OVER (PARTITION BY c.id_usuario ORDER BY c.cita_fecha, c.cita_hora) AS numero_cita,
+    c.id_cita,
+    u.usuario_nombre AS paciente_nombre, u.usuario_apellido AS paciente_apellido,
+    DATE_FORMAT(c.cita_fecha, '%d/%m/%Y') AS cita_fecha,
+    TIME_FORMAT(c.cita_hora, '%H:%i') AS cita_hora,
+    e.especialidad_nombre,
+    mu.usuario_nombre AS medico_nombre, mu.usuario_apellido AS medico_apellido,
+    c.cita_estado
+  FROM citas c
+  INNER JOIN usuarios u  ON c.id_usuario = u.id_usuario
+  INNER JOIN medicos m   ON c.id_medico  = m.id_medico
+  INNER JOIN usuarios mu ON m.id_medico  = mu.id_usuario
+  INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
+  ORDER BY u.usuario_nombre ASC, numero_cita ASC`;
+  conexion.query(q, (e, r) => e ? res.status(500).json({ error: "Error al obtener las citas" })
+                               : res.json({ listaCitas: r || [] }));
+});
+
+// Mantén /citas/:usuario pero si :usuario === "0" devuelve todas
+// (compat con llamadas existentes de tu UI)
+const getCitasUsuarioHandler = (req, res) => {
+  const { usuario } = req.params;
+  if (String(usuario) === "0") return app._router.handle({ ...req, method: "GET", url: "/citas" }, res, () => {});
+  const sql = `
+    SELECT c.id_cita, c.id_usuario, c.id_medico,
+           DATE_FORMAT(c.cita_fecha,'%d/%m/%Y') AS cita_fecha,
+           TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora,
+           u.usuario_nombre AS medico_nombre, u.usuario_apellido AS medico_apellido,
+           e.id_especialidad, e.especialidad_nombre, c.cita_estado
+    FROM citas c
+    INNER JOIN medicos m ON c.id_medico = m.id_medico
+    INNER JOIN usuarios u ON m.id_medico = u.id_usuario
+    INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
+    WHERE c.id_usuario = ?
+    ORDER BY c.id_cita ASC`;
+  conexion.query(sql, [usuario], (e, rows) =>
+    e ? res.status(500).json({ error: e.message })
+      : res.json({ listaCitas: rows.map((x,i)=>({ ...x, numero_orden: i+1 })) })
+  );
+};
+app.get("/citas/:usuario", getCitasUsuarioHandler);
 
 /* ============ START ============ */
 app.listen(PUERTO, () => console.log("🚀 Servidor en puerto " + PUERTO));
