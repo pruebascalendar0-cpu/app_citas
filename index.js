@@ -16,12 +16,12 @@ app.use((req, res, next) => {
   const started = Date.now();
   console.log(`[${req.rid}] -> ${req.method} ${req.originalUrl}`);
   if (["POST", "PUT"].includes(req.method)) {
-    try {
-      console.log(`[${req.rid}] body:`, req.body);
-    } catch {}
+    try { console.log(`[${req.rid}] body:`, req.body); } catch {}
   }
   res.on("finish", () => {
-    console.log(`[${req.rid}] <- ${res.statusCode} ${req.method} ${req.originalUrl} (${Date.now() - started}ms)`);
+    console.log(
+      `[${req.rid}] <- ${res.statusCode} ${req.method} ${req.originalUrl} (${Date.now() - started}ms)`
+    );
   });
   next();
 });
@@ -33,8 +33,8 @@ app.use((req, res, next) => {
  * - Crear App Password y usarla en EMAIL_PASSWORD
  * Variables .env soportadas:
  *   SMTP_HOST=smtp.gmail.com
- *   SMTP_PORT=465
- *   SMTP_SECURE=true
+ *   SMTP_PORT=587
+ *   SMTP_SECURE=false
  *   EMAIL_USER=pruebascalendar0@gmail.com
  *   EMAIL_PASSWORD=APP_PASSWORD
  *   EMAIL_FROM=Clínica Salud Total <pruebascalendar0@gmail.com>
@@ -43,8 +43,8 @@ app.use((req, res, next) => {
  */
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || "smtp.gmail.com",
-  port: Number(process.env.SMTP_PORT || 465),
-  secure: String(process.env.SMTP_SECURE || "true") === "true", // true=465, false=587
+  port: Number(process.env.SMTP_PORT || 587), // 587 suele ir mejor en Render
+  secure: String(process.env.SMTP_SECURE || "false") === "true",
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASSWORD,
@@ -52,8 +52,10 @@ const transporter = nodemailer.createTransport({
   pool: true,
   maxConnections: 3,
   maxMessages: 50,
-  connectionTimeout: 15000,
-  socketTimeout: 20000,
+  connectionTimeout: 20000,
+  socketTimeout: 30000,
+  logger: true, // logs SMTP
+  debug: true,  // logs detallados
 });
 
 const FROM = process.env.EMAIL_FROM || `Clínica Salud Total <${process.env.EMAIL_USER}>`;
@@ -149,7 +151,8 @@ conexion.connect((err) => {
   conexion.query("SET time_zone = '-05:00'", () => {});
 
   // Asegura tabla de códigos de reset
-  conexion.query(`
+  conexion.query(
+    `
     CREATE TABLE IF NOT EXISTS reset_codes (
       id INT AUTO_INCREMENT PRIMARY KEY,
       email VARCHAR(150) NOT NULL,
@@ -160,10 +163,12 @@ conexion.connect((err) => {
       INDEX (email),
       INDEX (expires_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  `, (e) => {
-    if (e) console.error("⚠️  No se pudo crear/verificar tabla reset_codes:", e.message);
-    else console.log("✅ Tabla reset_codes lista");
-  });
+  `,
+    (e) => {
+      if (e) console.error("⚠️  No se pudo crear/verificar tabla reset_codes:", e.message);
+      else console.log("✅ Tabla reset_codes lista");
+    }
+  );
 });
 
 app.get("/", (_, res) => res.send("API Clínica Salud Total"));
@@ -219,7 +224,8 @@ app.post("/usuario/login", (req, res) => {
   const { usuario_correo, password } = req.body || {};
   if (!usuario_correo || !password) return res.status(400).json({ mensaje: "Correo y password requeridos" });
 
-  const q = "SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo, usuario_contrasena_hash FROM usuarios WHERE usuario_correo=?";
+  const q =
+    "SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo, usuario_contrasena_hash FROM usuarios WHERE usuario_correo=?";
   conexion.query(q, [usuario_correo], (e, rows) => {
     if (e) return res.status(500).json({ mensaje: "Error en la base de datos" });
     if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
@@ -271,6 +277,24 @@ app.post("/usuario/agregar", (req, res) => {
   });
 });
 
+// Listado de usuarios (para panel admin)
+app.get("/usuarios", (req, res) => {
+  console.log(`[${req.rid}] /usuarios -> consultando`);
+  const sql = `
+    SELECT id_usuario, usuario_dni, usuario_nombre, usuario_apellido,
+           usuario_correo, usuario_tipo
+    FROM usuarios
+    ORDER BY id_usuario ASC`;
+  conexion.query(sql, (e, rows) => {
+    if (e) {
+      console.error(`[${req.rid}] /usuarios error DB:`, e.message);
+      return res.status(500).json({ error: "Error al cargar usuarios" });
+    }
+    console.log(`[${req.rid}] /usuarios -> ${rows.length} usuario(s)`);
+    res.json({ listaUsuarios: rows });
+  });
+});
+
 /* =================== RESET DE CONTRASEÑA (para Android) =================== */
 function genCode6() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -297,7 +321,6 @@ app.post("/usuario/reset/solicitar", (req, res) => {
       return res.status(500).json({ ok: false, mensaje: "Error en base de datos" });
     }
     if (!r1.length) {
-      // Evitar filtrar existencia (respuesta genérica)
       console.log(`[${req.rid}] reset/solicitar: correo no registrado (respuesta genérica ok)`);
       return res.json({ ok: true, mensaje: "Si el correo existe, se envió un código." });
     }
@@ -446,8 +469,8 @@ app.get("/horarios/disponibles/:id_medico/:fecha/:id_especialidad", (req, res) =
     WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND id_especialidad=?`;
   conexion.query(q, [id_medico, fecha, id_especialidad], (e, r) => {
     if (e) return res.status(500).json({ error: "Error al consultar horarios" });
-    const ocupadas = r.map(x => x.hora);
-    const disponibles = todas.filter(h => !ocupadas.includes(h));
+    const ocupadas = r.map((x) => x.hora);
+    const disponibles = todas.filter((h) => !ocupadas.includes(h));
     res.json({ horariosDisponibles: disponibles });
   });
 });
@@ -463,8 +486,60 @@ app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", (req, res) =
     ORDER BY horario_hora ASC`;
   conexion.query(sql, [id_medico, fecha, id_especialidad], (err, rows) => {
     if (err) return res.status(500).json({ error: "Error interno del servidor" });
-    res.json({ horarios: rows.map(r => r.horario_hora) });
+    res.json({ horarios: rows.map((r) => r.horario_hora) });
   });
+});
+
+// Editar/ocupar/liberar/eliminar un horario (endpoint que usa tu app)
+app.put("/horario/editar/:id_medico/:fecha/:hora", (req, res) => {
+  const { id_medico } = req.params;
+  const fecha = toYYYYMMDD(req.params.fecha);
+  const hora = req.params.hora;
+  const { accion } = req.body || {};
+
+  console.log(`[${req.rid}] /horario/editar ->`, { id_medico, fecha, hora, accion });
+
+  if (!/^\d{2}:\d{2}$/.test(hora)) {
+    return res.status(400).json({ mensaje: "Hora inválida (HH:mm)" });
+  }
+
+  if (accion === "ocupar") {
+    const q = `
+      UPDATE horarios_medicos SET horario_estado=1
+      WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d')
+        AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+    return conexion.query(q, [id_medico, fecha, hora], (e, r) => {
+      if (e) return res.status(500).json({ mensaje: "Error al ocupar horario" });
+      console.log(`[${req.rid}] /horario/editar -> ocupar affected=${r.affectedRows}`);
+      res.json({ mensaje: "Horario ocupado" });
+    });
+  }
+
+  if (accion === "liberar") {
+    const q = `
+      UPDATE horarios_medicos SET horario_estado=0
+      WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d')
+        AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+    return conexion.query(q, [id_medico, fecha, hora], (e, r) => {
+      if (e) return res.status(500).json({ mensaje: "Error al liberar horario" });
+      console.log(`[${req.rid}] /horario/editar -> liberar affected=${r.affectedRows}`);
+      res.json({ mensaje: "Horario liberado" });
+    });
+  }
+
+  if (accion === "eliminar") {
+    const q = `
+      DELETE FROM horarios_medicos
+      WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d')
+        AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+    return conexion.query(q, [id_medico, fecha, hora], (e, r) => {
+      if (e) return res.status(500).json({ mensaje: "Error al eliminar horario" });
+      console.log(`[${req.rid}] /horario/editar -> eliminar affected=${r.affectedRows}`);
+      res.json({ mensaje: "Horario eliminado" });
+    });
+  }
+
+  return res.status(400).json({ mensaje: "Acción inválida (ocupar|liberar|eliminar)" });
 });
 
 /* =================== CITAS =================== */
@@ -553,7 +628,8 @@ app.put("/cita/actualizar/:id", (req, res) => {
 // Anular por id_cita
 app.put("/cita/anular/:id_cita", (req, res) => {
   const { id_cita } = req.params;
-  const q = "SELECT DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS cita_fecha, TIME_FORMAT(cita_hora,'%H:%i') AS cita_hora, id_medico FROM citas WHERE id_cita=?";
+  const q =
+    "SELECT DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS cita_fecha, TIME_FORMAT(cita_hora,'%H:%i') AS cita_hora, id_medico FROM citas WHERE id_cita=?";
   conexion.query(q, [id_cita], (e1, r1) => {
     if (e1 || !r1.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
     const { cita_fecha, cita_hora, id_medico } = r1[0];
@@ -562,7 +638,9 @@ app.put("/cita/anular/:id_cita", (req, res) => {
       const qLib = `
         UPDATE horarios_medicos SET horario_estado=0
         WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
-      conexion.query(qLib, [id_medico, cita_fecha, cita_hora], () => res.json({ mensaje: "Cita cancelada y horario liberado" }));
+      conexion.query(qLib, [id_medico, cita_fecha, cita_hora], () =>
+        res.json({ mensaje: "Cita cancelada y horario liberado" })
+      );
     });
   });
 });
@@ -592,15 +670,17 @@ app.get("/citas/:usuario", (req, res) => {
   });
 });
 
-// KPIs por día (sin toISOString)
+// KPIs por día (sin toISOString) + logs
 app.get("/citas/por-dia", (_, res) => {
+  console.log(`[citas/por-dia] -> consultando`);
   const q = `
     SELECT DATE_FORMAT(cita_fecha, '%Y-%m-%d') AS fecha, COUNT(*) AS cantidad
     FROM citas WHERE cita_estado=1
     GROUP BY DATE(cita_fecha) ORDER BY DATE(cita_fecha) ASC`;
   conexion.query(q, (e, rows) => {
     if (e) return res.status(500).json({ error: "Error en la base de datos" });
-    res.json({ listaCitas: rows.map(r => ({ fecha: r.fecha, cantidad: r.cantidad })) });
+    console.log(`[citas/por-dia] -> ${rows.length} fila(s)`);
+    res.json({ listaCitas: rows.map((r) => ({ fecha: r.fecha, cantidad: r.cantidad })) });
   });
 });
 
