@@ -1,3 +1,38 @@
+// --- BOOTSTRAP DEL SERVIDOR (debe ir arriba del archivo) ---
+require("dotenv").config();
+
+const express = require("express");
+const app = express();
+const mysql = require("mysql2");
+
+// Usa express.json() en lugar de body-parser
+app.use(express.json());
+
+// Puerto para Render
+const PORT = process.env.PORT || 3000;
+
+// Conexión MySQL (igual que antes)
+const conexion = mysql.createConnection({
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD
+});
+
+conexion.connect(err => {
+  if (err) {
+    console.error("Error conectando a MySQL:", err.message);
+    process.exit(1); // fallar el deploy si no hay DB
+  }
+  console.log("✅ Conexión exitosa a la base de datos");
+});
+
+// Healthcheck básico
+app.get("/", (req, res) => res.send("API OK"));
+// --- FIN BOOTSTRAP ---
+
+
 // === Gmail API (googleapis) ===
 const { google } = require("googleapis");
 
@@ -1097,4 +1132,7 @@ app.put("/especialidad/actualizar/:id", (req, res) => {
     }
     res.json({ mensaje: "Especialidad actualizada correctamente" });
   });
+});
+app.listen(PORT, () => {
+  console.log("🚀 Servidor corriendo en el puerto " + PORT);
 });
