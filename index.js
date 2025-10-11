@@ -38,7 +38,7 @@ const pool = mysql.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   connectionLimit: 10,
-  timezone: "Z", // devolvemos strings controladas con DATE_FORMAT / TIME_FORMAT
+  timezone: "Z", // devolvemos strings controladas con DATE_FORMAT/TIME_FORMAT
 });
 
 (async () => {
@@ -46,7 +46,19 @@ const pool = mysql.createPool({
     const conn = await pool.getConnection();
     await conn.ping();
     conn.release();
-    console.log("Conexion exitosa a la base de datos");
+    console.log("✅ Conexión MySQL OK");
+    // Tabla reset_codes (por si no existe)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS reset_codes (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(150) NOT NULL,
+        code_hash CHAR(64) NOT NULL,
+        expires_at DATETIME NOT NULL,
+        used TINYINT(1) NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX (email), INDEX (expires_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
   } catch (e) {
     console.error("ERROR DB:", e.message);
     process.exit(1);
@@ -110,7 +122,7 @@ async function correoActualizacion(rid, to, fecha, hora) {
   return enviarMail({
     rid, to,
     subject: "Actualización de tu cita médica",
-    html: wrap(`<h2>Cita actualizado</h2><p><b>Nueva fecha:</b> ${fecha}<br><b>Hora:</b> ${hora}</p>`),
+    html: wrap(`<h2>Cita actualizada</h2><p><b>Nueva fecha:</b> ${fecha}<br><b>Hora:</b> ${hora}</p>`),
     category: "cita-actualizada",
   });
 }
@@ -141,49 +153,70 @@ async function correoCodigoReset(rid, to, codigo) {
 
 /* =========================================
  *  Helpers de seguridad (hash+salt)
+ *  Formato: "<saltHex>:<sha256(saltHex + password)>"
+ *  (coincide con tu seed SQL: SHA2(CONCAT(salt_hex_texto,'password'),256))
  * ========================================= */
-function sha256Hex(buf) { return crypto.createHash("sha256").update(buf).digest("hex"); }
+function sha256HexFromString(str) {
+  return crypto.createHash("sha256").update(String(str)).digest("hex");
+}
 function verifyPassword(stored, plain) {
   if (!stored || !stored.includes(":")) return false;
   const [saltHex, hashHex] = stored.split(":");
-  const calc = sha256Hex(Buffer.concat([Buffer.from(saltHex, "hex"), Buffer.from(plain)]));
-  const a = Buffer.from(hashHex, "hex");
-  const b = Buffer.from(calc, "hex");
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  const calc = sha256HexFromString(saltHex + String(plain));
+  return (
+    calc.length === hashHex.length &&
+    crypto.timingSafeEqual(Buffer.from(calc, "hex"), Buffer.from(hashHex, "hex"))
+  );
 }
 function newPasswordHash(plain) {
-  const salt = crypto.randomBytes(16).toString("hex");
-  const hash = sha256Hex(Buffer.concat([Buffer.from(salt, "hex"), Buffer.from(plain)]));
-  return `${salt}:${hash}`;
+  const saltHex = crypto.randomBytes(16).toString("hex"); // 32 hex chars
+  const hashHex = sha256HexFromString(saltHex + String(plain));
+  return `${saltHex}:${hashHex}`;
+}
+
+/* =========================================
+ *  Utils horarios
+ * ========================================= */
+function hhmmToHHMMSS(hora) {
+  if (!hora) return hora;
+  return /^\d{2}:\d{2}$/.test(hora) ? `${hora}:00` : hora;
 }
 
 /* =========================================
  *  Raíz
  * ========================================= */
 app.get("/", (_, res) => res.send("Bienvenido a mi servicio web"));
+app.get("/health", (_, res) => res.json({ ok: true }));
 
 /* =========================================
- *  LOGIN
+ *  LOGIN (con hash correcto)
  * ========================================= */
 app.post("/usuario/login", async (req, res) => {
-  const { usuario_correo, password } = req.body || {};
   const rid = req.rid;
+  const correo = String(req.body?.usuario_correo || req.body?.email || "").trim().toLowerCase();
+  const pass = String(req.body?.password || "");
+
+  if (!correo || !pass) return res.status(400).json({ mensaje: "Correo y password requeridos" });
+
   try {
-    const sql = "SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo, usuario_contrasena_hash FROM usuarios WHERE usuario_correo=?";
-    console.log(`[${rid}] SQL> ${sql} params=["${usuario_correo}"]`);
-    const [rows] = await pool.query(sql, [usuario_correo]);
-    if (!rows.length) return res.status(401).json({ mensaje: "Credenciales inválidas" });
+    const sql = `
+      SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo, usuario_contrasena_hash
+        FROM usuarios
+       WHERE LOWER(usuario_correo)=?
+       LIMIT 1`;
+    const [rows] = await pool.query(sql, [correo]);
+    if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
 
-    const user = rows[0];
-    const ok = verifyPassword(user.usuario_contrasena_hash, password || "");
-    if (!ok) return res.status(401).json({ mensaje: "Credenciales inválidas" });
+    const u = rows[0];
+    const ok = verifyPassword(u.usuario_contrasena_hash, pass);
+    if (!ok) return res.status(401).json({ mensaje: "Contraseña incorrecta" });
 
-    return res.json({
-      id_usuario: user.id_usuario,
-      usuario_nombre: user.usuario_nombre,
-      usuario_apellido: user.usuario_apellido,
-      usuario_correo: user.usuario_correo,
-      usuario_tipo: user.usuario_tipo,
+    res.json({
+      id_usuario: u.id_usuario,
+      usuario_nombre: u.usuario_nombre,
+      usuario_apellido: u.usuario_apellido,
+      usuario_correo: u.usuario_correo,
+      usuario_tipo: u.usuario_tipo,
     });
   } catch (e) {
     console.error(`[${rid}] /usuario/login ERROR`, e);
@@ -202,17 +235,14 @@ app.post("/usuario/reset/solicitar", async (req, res) => {
     if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
 
     const codigo = Math.floor(100000 + Math.random() * 900000).toString();
-    const codeHash = sha256Hex(codigo);
+    const codeHash = sha256HexFromString(codigo);
     const hoy = new Date();
     const yyyy = hoy.getUTCFullYear();
     const mm = String(hoy.getUTCMonth() + 1).padStart(2, "0");
     const dd = String(hoy.getUTCDate()).padStart(2, "0");
     const expires = `${yyyy}-${mm}-${dd} 23:59:59`;
 
-    const ins = "INSERT INTO reset_codes (email, code_hash, expires_at, used) VALUES (?,?,?,0)";
-    console.log(`[${rid}] SQL> ${ins} params=["${usuario_correo}","${codeHash}","${expires}"]`);
-    await pool.query(ins, [usuario_correo, codeHash, expires]);
-
+    await pool.query("INSERT INTO reset_codes (email, code_hash, expires_at, used) VALUES (?,?,?,0)", [usuario_correo, codeHash, expires]);
     await correoCodigoReset(rid, usuario_correo, codigo);
     res.json({ mensaje: "Código enviado" });
   } catch (e) {
@@ -228,9 +258,11 @@ app.post("/usuario/reset/cambiar", async (req, res) => {
     return res.status(400).json({ mensaje: "Datos incompletos" });
   }
   try {
-    const codeHash = sha256Hex(String(codigo).replace(/\s+/g, ""));
-    const sel = `SELECT id, used, expires_at FROM reset_codes WHERE email=? AND code_hash=? ORDER BY id DESC LIMIT 1`;
-    const [rows] = await pool.query(sel, [usuario_correo, codeHash]);
+    const codeHash = sha256HexFromString(String(codigo).replace(/\s+/g, ""));
+    const [rows] = await pool.query(
+      `SELECT id, used, expires_at FROM reset_codes WHERE email=? AND code_hash=? ORDER BY id DESC LIMIT 1`,
+      [usuario_correo, codeHash]
+    );
     if (!rows.length) return res.status(400).json({ mensaje: "Código inválido" });
     const rec = rows[0];
     if (rec.used) return res.status(400).json({ mensaje: "Código ya usado" });
@@ -248,7 +280,7 @@ app.post("/usuario/reset/cambiar", async (req, res) => {
 });
 
 /* =========================================
- *  ALIAS usados por Android (consulta correo + recuperar)
+ *  ALIAS Android (consulta correo + enviar código)
  * ========================================= */
 app.post("/usuario/recuperar-correo", async (req, res) => {
   const rid = req.rid;
@@ -284,15 +316,14 @@ app.post("/usuario/recuperar-contrasena", async (req, res) => {
     if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
 
     const codigo = Math.floor(100000 + Math.random() * 900000).toString();
-    const codeHash = sha256Hex(codigo);
+    const codeHash = sha256HexFromString(codigo);
     const hoy = new Date();
     const yyyy = hoy.getUTCFullYear();
     const mm = String(hoy.getUTCMonth() + 1).padStart(2, "0");
     const dd = String(hoy.getUTCDate()).padStart(2, "0");
     const expires = `${yyyy}-${mm}-${dd} 23:59:59`;
 
-    const ins = "INSERT INTO reset_codes (email, code_hash, expires_at, used) VALUES (?,?,?,0)";
-    await pool.query(ins, [usuario_correo, codeHash, expires]);
+    await pool.query("INSERT INTO reset_codes (email, code_hash, expires_at, used) VALUES (?,?,?,0)", [usuario_correo, codeHash, expires]);
     await correoCodigoReset(rid, usuario_correo, codigo);
     res.json({ mensaje: "Código enviado" });
   } catch (e) {
@@ -364,9 +395,11 @@ app.post("/usuario/agregar", async (req, res) => {
     }
 
     const usuario_contrasena_hash = newPasswordHash(usuario_contrasena);
-    const ins = `INSERT INTO usuarios (usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_contrasena_hash,usuario_tipo)
-                 VALUES (?,?,?,?,?,?)`;
-    const [r] = await pool.query(ins, [usuario_nombre, usuario_apellido, usuario_correo, usuario_dni, usuario_contrasena_hash, usuario_tipo]);
+    const [r] = await pool.query(
+      `INSERT INTO usuarios (usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_contrasena_hash,usuario_tipo)
+       VALUES (?,?,?,?,?,?)`,
+      [usuario_nombre, usuario_apellido, usuario_correo, usuario_dni, usuario_contrasena_hash, usuario_tipo]
+    );
     await correoBienvenida(rid, usuario_correo, `${usuario_nombre} ${usuario_apellido}`);
     res.json({ mensaje: "Usuario registrado correctamente.", id_usuario: r.insertId });
   } catch (e) {
@@ -385,7 +418,6 @@ app.post("/usuario/agregar", async (req, res) => {
 });
 
 app.post("/usuario/registrar", async (req, res) => {
-  // Registrar médico con especialidad (opcional)
   const rid = req.rid;
   try {
     const {
@@ -400,6 +432,7 @@ app.post("/usuario/registrar", async (req, res) => {
     if (!usuario_nombre || !usuario_apellido || !usuario_correo || !usuario_contrasena) {
       return res.status(400).json({ mensaje: "Datos de usuario incompletos." });
     }
+
     const usuario_contrasena_hash = newPasswordHash(usuario_contrasena);
     const [ru] = await pool.query(
       `INSERT INTO usuarios (usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_contrasena_hash,usuario_tipo)
@@ -432,7 +465,7 @@ app.put("/usuario/actualizar/:id", async (req, res) => {
   try {
     const [dup] = await pool.query("SELECT 1 FROM usuarios WHERE usuario_correo=? AND id_usuario<>?", [usuario_correo, id]);
     if (dup.length) return res.status(409).json({ mensaje: "El correo ya está en uso por otro usuario" });
-    const [r] = await pool.query(
+    await pool.query(
       "UPDATE usuarios SET usuario_nombre=?, usuario_apellido=?, usuario_correo=? WHERE id_usuario=?",
       [usuario_nombre, usuario_apellido, usuario_correo, id]
     );
@@ -513,11 +546,6 @@ app.get("/medico/:id_medico/especialidades", async (req, res) => {
 /* =========================================
  *  HORARIOS
  * ========================================= */
-function hhmmToHHMMSS(hora) {
-  if (!hora) return hora;
-  return /^\d{2}:\d{2}$/.test(hora) ? `${hora}:00` : hora;
-}
-
 // Horarios detallados (libres) por fecha + especialidad (para CitaActivity)
 app.get("/horarios/:fecha/:id_especialidad", async (req, res) => {
   const rid = req.rid;
@@ -543,7 +571,7 @@ app.get("/horarios/:fecha/:id_especialidad", async (req, res) => {
   }
 });
 
-// Horarios disponibles (solo horas) para pantalla del médico
+// Horarios disponibles (solo horas libres) para pantalla del médico
 app.get("/horarios/disponibles/:id_medico/:fecha/:id_especialidad", async (req, res) => {
   const rid = req.rid;
   const { id_medico, fecha, id_especialidad } = req.params;
@@ -561,7 +589,7 @@ app.get("/horarios/disponibles/:id_medico/:fecha/:id_especialidad", async (req, 
   }
 });
 
-// Horarios registrados (todos los estados) para edición del médico
+// Horarios registrados (todos) para edición del médico
 app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", async (req, res) => {
   const rid = req.rid;
   const { id_medico, fecha, id_especialidad } = req.params;
@@ -587,10 +615,11 @@ app.post("/horario/registrar", async (req, res) => {
     return res.status(400).json({ mensaje: "Datos incompletos" });
   }
   try {
-    const ins = `
-      INSERT INTO horarios_medicos (id_medico, horario_fecha, horario_hora, horario_estado, id_especialidad)
-      VALUES (?, ?, ?, 0, ?)`;
-    const [r] = await pool.query(ins, [id_medico, fecha, hhmmToHHMMSS(hora), id_especialidad]);
+    const [r] = await pool.query(
+      `INSERT INTO horarios_medicos (id_medico, horario_fecha, horario_hora, horario_estado, id_especialidad)
+       VALUES (?, ?, ?, 0, ?)`,
+      [id_medico, fecha, hhmmToHHMMSS(hora), id_especialidad]
+    );
     res.json({ mensaje: "Horario registrado correctamente", id_horario: r.insertId });
   } catch (e) {
     if (e && e.code === "ER_DUP_ENTRY") {
@@ -781,10 +810,12 @@ app.post("/cita/agregar", async (req, res) => {
   const rid = req.rid;
   const { id_usuario, id_medico, cita_fecha, cita_hora } = req.body || {};
   try {
-    const qSlot = `SELECT id_horario, id_especialidad, horario_estado
-                     FROM horarios_medicos
-                    WHERE id_medico=? AND horario_fecha=? AND horario_hora=?`;
-    const [slotRows] = await pool.query(qSlot, [id_medico, cita_fecha, hhmmToHHMMSS(cita_hora)]);
+    const [slotRows] = await pool.query(
+      `SELECT id_horario, id_especialidad, horario_estado
+         FROM horarios_medicos
+        WHERE id_medico=? AND horario_fecha=? AND horario_hora=?`,
+      [id_medico, cita_fecha, hhmmToHHMMSS(cita_hora)]
+    );
     if (!slotRows.length || slotRows[0].horario_estado !== 0) {
       return res.status(409).json({ mensaje: "El horario no está disponible" });
     }
@@ -830,7 +861,7 @@ app.put("/cita/actualizar/:id", async (req, res) => {
       return res.status(409).json({ mensaje: "El nuevo horario no está disponible" });
     }
 
-    const [rUpd] = await pool.query(
+    await pool.query(
       `UPDATE citas SET id_usuario=?, id_medico=?, cita_fecha=?, cita_hora=?, cita_estado=? WHERE id_cita=?`,
       [id_usuario, id_medico, cita_fecha, hhmmToHHMMSS(cita_hora), cita_estado, id]
     );
