@@ -30,37 +30,59 @@ app.use((req, res, next) => {
 /**
  * Requisitos para Gmail:
  * - Activar 2FA en la cuenta
- * - Crear App Password y usarla en EMAIL_PASSWORD
- * Variables .env soportadas:
+ * - Crear App Password y usarla en EMAIL_PASSWORD (sin espacios)
+ *
+ * Variables .env típicas:
  *   SMTP_HOST=smtp.gmail.com
+ *   SMTP_PORT=587        # o 465
+ *   SMTP_SECURE=false    # o true si usas 465
+ *   EMAIL_USER=pruebascalendar0@gmail.com
+ *   EMAIL_PASSWORD=APP_PASSWORD_SIN_ESPACIOS
+ *   EMAIL_FROM="Clínica Salud Total <pruebascalendar0@gmail.com>"
+ *   REPLY_TO=pruebascalendar0@gmail.com
+ *
+ * Alternativa RELAY (recomendado en Render si Gmail hace timeout):
+ *   # Resend:
+ *   SMTP_HOST=smtp.resend.com
  *   SMTP_PORT=587
  *   SMTP_SECURE=false
- *   EMAIL_USER=pruebascalendar0@gmail.com
- *   EMAIL_PASSWORD=APP_PASSWORD
- *   EMAIL_FROM=Clínica Salud Total <pruebascalendar0@gmail.com>
- *   REPLY_TO=pruebascalendar0@gmail.com
- *   (opcionales) UNSUB_MAILTO, UNSUB_URL
+ *   EMAIL_USER=resend
+ *   EMAIL_PASSWORD=RESEND_API_KEY
+ *   EMAIL_FROM="Clínica Salud Total <no-reply@TU-DOMINIO>"
+ *
+ * Fallback de pruebas (no envía correo real, imprime JSON en logs):
+ *   SMTP_STRATEGY=json
  */
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || "smtp.gmail.com",
-  port: Number(process.env.SMTP_PORT || 587),          // 587 recomendado en Render
-  secure: String(process.env.SMTP_SECURE || "false") === "true",
-  auth: {
-    user: process.env.EMAIL_USER,
-    // quita espacios por si el App Password vino con espacios
-    pass: (process.env.EMAIL_PASSWORD || "").replace(/\s+/g, ""),
-  },
-  pool: true,
-  maxConnections: 3,
-  maxMessages: 50,
-  connectionTimeout: 30000,  // + tiempo
-  socketTimeout: 45000,      // + tiempo
-  logger: true,
-  debug: true,
-  // Fuerza IPv4 (evita timeouts cuando el proveedor da preferencia a IPv6)
-  family: 4,
-  // tls: { rejectUnauthorized: false }, // déjalo comentado; solo si un proveedor raro lo requiere
-});
+function buildTransport() {
+  const strategy = (process.env.SMTP_STRATEGY || "smtp").toLowerCase();
+
+  if (strategy === "json") {
+    console.log("⚙️  Email transport: JSON (no envía, solo log)");
+    return nodemailer.createTransport({ jsonTransport: true });
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || "false") === "true",
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: (process.env.EMAIL_PASSWORD || "").replace(/\s+/g, ""), // limpia espacios
+    },
+    pool: true,
+    maxConnections: 3,
+    maxMessages: 50,
+    connectionTimeout: 30000,
+    socketTimeout: 45000,
+    logger: true,
+    debug: true,
+    family: 4, // fuerza IPv4
+    // tls: { rejectUnauthorized: false }, // dejar comentado salvo que el proveedor lo exija
+  });
+
+  return transporter;
+}
+const transporter = buildTransport();
 
 const FROM = process.env.EMAIL_FROM || `Clínica Salud Total <${process.env.EMAIL_USER}>`;
 const REPLY_TO = process.env.REPLY_TO || process.env.EMAIL_USER;
@@ -102,7 +124,8 @@ async function enviarMail({ to, subject, html, text, category = "notificaciones"
   try {
     console.log(`[@mail] intent: to=${to} subject="${subject}" category=${category}`);
     const info = await transporter.sendMail(msg);
-    console.log(`[@mail] ok: messageId=${info.messageId}`);
+    // jsonTransport devuelve el contenido en info.message; SMTP devuelve messageId
+    console.log(`[@mail] ok:`, info.messageId ? `messageId=${info.messageId}` : info);
     return info;
   } catch (e) {
     console.error(`[@mail] error:`, e?.response || e);
@@ -649,13 +672,70 @@ app.put("/cita/anular/:id_cita", (req, res) => {
   });
 });
 
+// NUEVOS: Buscar una cita por id_usuario + numero_orden
+app.get("/cita/usuario/:id_usuario/orden/:numero_orden", (req, res) => {
+  const { id_usuario, numero_orden } = req.params;
+  const sql = `
+    SELECT c.id_cita, c.id_usuario, c.id_medico, c.numero_orden,
+           DATE_FORMAT(c.cita_fecha,'%Y-%m-%d') AS cita_fecha,
+           TIME_FORMAT(c.cita_hora,'%H:%i')     AS cita_hora,
+           c.cita_estado,
+           u.usuario_nombre AS medico_nombre, u.usuario_apellido AS medico_apellido,
+           e.id_especialidad, e.especialidad_nombre
+    FROM citas c
+    INNER JOIN medicos m ON c.id_medico = m.id_medico
+    INNER JOIN usuarios u ON m.id_medico = u.id_usuario
+    INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
+    WHERE c.id_usuario=? AND c.numero_orden=?
+    LIMIT 1`;
+  conexion.query(sql, [id_usuario, numero_orden], (e, rows) => {
+    if (e) return res.status(500).json({ mensaje: "Error en DB" });
+    if (!rows.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
+    res.json(rows[0]);
+  });
+});
+
+// NUEVO: Anular por id_usuario + numero_orden
+app.put("/cita/anular/:id_usuario/:numero_orden", (req, res) => {
+  const { id_usuario, numero_orden } = req.params;
+
+  const qSel = `
+    SELECT id_cita, id_medico,
+           DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS cita_fecha,
+           TIME_FORMAT(cita_hora,'%H:%i')     AS cita_hora
+    FROM citas
+    WHERE id_usuario=? AND numero_orden=?
+    LIMIT 1`;
+  conexion.query(qSel, [id_usuario, numero_orden], (e1, r1) => {
+    if (e1) return res.status(500).json({ mensaje: "Error buscando cita" });
+    if (!r1.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
+
+    const { id_cita, id_medico, cita_fecha, cita_hora } = r1[0];
+    conexion.query("UPDATE citas SET cita_estado=0 WHERE id_cita=?", [id_cita], (e2) => {
+      if (e2) return res.status(500).json({ mensaje: "No se pudo anular la cita" });
+
+      const qLib = `
+        UPDATE horarios_medicos SET horario_estado=0
+        WHERE id_medico=? AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i')`;
+      conexion.query(qLib, [id_medico, cita_fecha, cita_hora], (e3) => {
+        if (e3) return res.status(500).json({ mensaje: "No se pudo liberar el horario" });
+        res.json({ mensaje: "Cita anulada y horario liberado" });
+      });
+    });
+  });
+});
+
 // Citas por usuario (fechas ya formateadas para UI)
 app.get("/citas/:usuario", (req, res) => {
   const { usuario } = req.params;
   console.log(`[${req.rid}] /citas/${usuario} -> consultando`);
 
+  if (String(usuario) === "0") {
+    console.warn(`[${req.rid}] /citas: id_usuario=0 recibido; cliente debe enviar el id real del login`);
+  }
+
   const consulta = `
-    SELECT c.id_cita, c.id_usuario, c.id_medico,
+    SELECT c.id_cita, c.id_usuario, c.id_medico, c.numero_orden,
            DATE_FORMAT(c.cita_fecha, '%d/%m/%Y') AS cita_fecha,
            TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora,
            u.usuario_nombre AS medico_nombre, u.usuario_apellido AS medico_apellido,
@@ -668,7 +748,7 @@ app.get("/citas/:usuario", (req, res) => {
     ORDER BY c.id_cita ASC`;
   conexion.query(consulta, [usuario], (error, rpta) => {
     if (error) return res.status(500).json({ error: error.message });
-    const lista = rpta.map((cita, idx) => ({ ...cita, numero_orden: idx + 1 }));
+    const lista = rpta.map((cita, idx) => ({ ...cita, numero_orden: cita.numero_orden || (idx + 1) }));
     console.log(`[${req.rid}] /citas/${usuario} -> ${lista.length} cita(s)`);
     res.json({ listaCitas: lista });
   });
