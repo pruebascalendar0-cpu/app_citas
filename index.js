@@ -573,38 +573,70 @@ app.post("/cita/agregar", (req, res) => {
 
 app.put("/cita/actualizar/:id", (req, res) => {
   const { id } = req.params;
-  const { id_usuario, id_medico, cita_fecha, cita_hora, cita_estado } = req.body;
-  if (!id_usuario || !id_medico || !cita_fecha || !cita_hora) return res.status(400).json({ mensaje: "Datos incompletos para actualizar la cita" });
+  let { id_usuario, id_medico, cita_fecha, cita_hora, cita_estado } = req.body;
+  cita_fecha = toYYYYMMDD(cita_fecha);
+  if (!id_usuario || !id_medico || !cita_fecha || !cita_hora) {
+    return res.status(400).json({ mensaje: "Datos incompletos para actualizar la cita" });
+  }
 
-  conexion.query("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], (e0, rows) => {
-    if (e0 || rows.length === 0) return res.status(500).json({ mensaje: "No se pudo obtener el correo del usuario" });
-    const usuario_correo = rows[0].usuario_correo;
+  conexion.query(
+    "SELECT usuario_correo FROM usuarios WHERE id_usuario=?",
+    [id_usuario],
+    (e0, rows) => {
+      if (e0 || rows.length === 0) return res.status(500).json({ mensaje: "No se pudo obtener el correo del usuario" });
+      const usuario_correo = rows[0].usuario_correo;
 
-    conexion.query("SELECT cita_fecha, cita_hora FROM citas WHERE id_cita=?", [id], (e1, r1) => {
-      if (e1 || r1.length === 0) return res.status(500).json({ mensaje: "Error al obtener horario anterior" });
-      const anterior = r1[0];
+      const qAnterior = `
+        SELECT
+          DATE_FORMAT(cita_fecha, '%Y-%m-%d') AS cita_fecha,
+          TIME_FORMAT(cita_hora, '%H:%i')      AS cita_hora
+        FROM citas
+        WHERE id_cita = ?
+      `;
+      conexion.query(qAnterior, [id], (e1, r1) => {
+        if (e1 || r1.length === 0) return res.status(500).json({ mensaje: "Error al obtener horario anterior" });
+        const anterior = r1[0]; // { cita_fecha: 'YYYY-MM-DD', cita_hora: 'HH:mm' }
 
-      conexion.query(
-        "UPDATE horarios_medicos SET horario_estado=0 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?",
-        [anterior.cita_fecha, anterior.cita_hora, id_medico], () => {}
-      );
+        const qLiberar = `
+          UPDATE horarios_medicos
+          SET horario_estado = 0
+          WHERE horario_fecha = STR_TO_DATE(?, '%Y-%m-%d')
+            AND horario_hora  = STR_TO_DATE(?, '%H:%i')
+            AND id_medico = ?
+        `;
+        conexion.query(qLiberar, [anterior.cita_fecha, anterior.cita_hora, id_medico], () => {});
 
-      const up = `
-        UPDATE citas 
-        SET id_usuario=?, id_medico=?, cita_fecha=STR_TO_DATE(?, '%Y-%m-%d'), cita_hora=STR_TO_DATE(?, '%H:%i'), cita_estado=? 
-        WHERE id_cita=?`;
-      conexion.query(up, [id_usuario, id_medico, cita_fecha, cita_hora, cita_estado, id], (e3) => {
-        if (e3) return res.status(500).json({ mensaje: "Error al actualizar la cita" });
-
+        const qUpdate = `
+          UPDATE citas 
+          SET id_usuario=?,
+              id_medico=?,
+              cita_fecha=STR_TO_DATE(?, '%Y-%m-%d'),
+              cita_hora =STR_TO_DATE(?, '%H:%i'),
+              cita_estado=?
+          WHERE id_cita=?
+        `;
         conexion.query(
-          "UPDATE horarios_medicos SET horario_estado=1 WHERE horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') AND horario_hora=STR_TO_DATE(?, '%H:%i') AND id_medico=?",
-          [cita_fecha, cita_hora, id_medico], () => {}
+          qUpdate,
+          [id_usuario, id_medico, cita_fecha, cita_hora, (cita_estado ?? 1), id],
+          (e3) => {
+            if (e3) return res.status(500).json({ mensaje: "Error al actualizar la cita" });
+
+            const qOcupar = `
+              UPDATE horarios_medicos
+              SET horario_estado = 1
+              WHERE horario_fecha = STR_TO_DATE(?, '%Y-%m-%d')
+                AND horario_hora  = STR_TO_DATE(?, '%H:%i')
+                AND id_medico = ?
+            `;
+            conexion.query(qOcupar, [cita_fecha, cita_hora, id_medico], () => {});
+
+            enviarCorreoActualizacion(usuario_correo, cita_fecha, cita_hora).catch(() => {});
+            res.status(200).json({ mensaje: "Cita actualizada correctamente" });
+          }
         );
-        enviarCorreoActualizacion(usuario_correo, cita_fecha, cita_hora).catch(() => {});
-        res.status(200).json({ mensaje: "Cita actualizada correctamente" });
       });
-    });
-  });
+    }
+  );
 });
 
 app.put("/cita/anular/:id_cita", (req, res) => {
@@ -650,14 +682,15 @@ app.put("/cita/anular/:id_usuario/:numero_orden", (req, res) => {
 
 app.get("/citas/por-dia", (req, res) => {
   const consulta = `
-    SELECT DATE(cita_fecha) AS fecha, COUNT(*) AS cantidad
+    SELECT DATE_FORMAT(cita_fecha, '%Y-%m-%d') AS fecha, COUNT(*) AS cantidad
     FROM citas
     WHERE cita_estado = 1
     GROUP BY DATE(cita_fecha)
     ORDER BY DATE(cita_fecha) ASC`;
   conexion.query(consulta, (error, resultados) => {
     if (error) return res.status(500).json({ error: "Error en la base de datos" });
-    const datos = resultados.map(row => ({ fecha: row.fecha.toISOString().slice(0, 10), cantidad: row.cantidad }));
+    // ya viene 'YYYY-MM-DD' desde MySQL
+    const datos = resultados.map(row => ({ fecha: row.fecha, cantidad: row.cantidad }));
     res.json({ listaCitas: datos });
   });
 });
