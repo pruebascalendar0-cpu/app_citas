@@ -107,10 +107,11 @@ function saltHash(plain) {
   const hash = crypto.createHash("sha256").update(salt + plain).digest("hex");
   return `${salt}:${hash}`;
 }
-function verifyHash(plain, stored) {
+
+function verifyPassword(plain, stored) {
   if (!stored || !stored.includes(":")) return false;
   const [salt, hash] = stored.split(":");
-  const test = crypto.createHash("sha256").update(salt + plain).digest("hex");
+  const test = crypto.createHash("sha256").update(salt + String(plain)).digest("hex");
   return test.toLowerCase() === (hash || "").toLowerCase();
 }
 
@@ -140,29 +141,56 @@ conexion.connect((err) => {
 app.get("/", (_, res) => res.send("API Clínica Salud Total"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-/* ============ USUARIOS ============ */
-// LOGIN tolerante (hash o plano) + correo case-insensitive
+// ===== LOGIN (compatible con tu BD actual) =====
 app.post("/usuario/login", (req, res) => {
-  const correo = String(req.body?.usuario_correo || "").trim().toLowerCase();
-  const password = String(req.body?.password ?? req.body?.contrasena ?? req.body?.pass ?? "");
-  if (!correo || !password) return res.status(400).json({ mensaje: "Faltan datos" });
+  try {
+    const correo = String(req.body?.usuario_correo || "").trim().toLowerCase();
+    // por si en algún cliente llega con otra key
+    const password = String(req.body?.password ?? req.body?.contrasena ?? req.body?.pass ?? "");
 
-  const q = `
-    SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo,
-           usuario_tipo, usuario_contrasena_hash, usuario_contrasena
-    FROM usuarios WHERE LOWER(usuario_correo)=?`;
-  conexion.query(q, [correo], (e, rows) => {
-    if (e) return res.status(500).json({ mensaje: "Error DB" });
-    if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
-    const u = rows[0];
-    let ok = false;
-    if (u.usuario_contrasena_hash && u.usuario_contrasena_hash.includes(":")) ok = verifyHash(password, u.usuario_contrasena_hash);
-    else if (u.usuario_contrasena) ok = String(password) === String(u.usuario_contrasena);
-    console.log("[LOGIN] verificación:", ok ? "OK" : "FAIL");
-    if (!ok) return res.status(401).json({ mensaje: "Contraseña incorrecta" });
+    console.log("[LOGIN] body:", { usuario_correo: correo, keys: Object.keys(req.body || {}) });
 
-    res.json({ id_usuario: u.id_usuario, usuario_nombre: u.usuario_nombre, usuario_apellido: u.usuario_apellido, usuario_correo: u.usuario_correo, usuario_tipo: u.usuario_tipo });
-  });
+    if (!correo || !password) {
+      return res.status(400).json({ mensaje: "Correo y password requeridos" });
+    }
+
+    const sql = `
+      SELECT id_usuario, usuario_nombre, usuario_apellido,
+             usuario_correo, usuario_tipo, usuario_contrasena_hash
+      FROM usuarios
+      WHERE LOWER(usuario_correo)=?
+      LIMIT 1
+    `;
+
+    db.query(sql, [correo], (err, rows) => {
+      if (err) {
+        console.error("[LOGIN] DB error:", err.code, err.message);
+        return res.status(500).json({ mensaje: "Error en base de datos" });
+      }
+      if (!rows.length) {
+        return res.status(404).json({ mensaje: "Correo no registrado" });
+      }
+
+      const u = rows[0];
+      const stored = u.usuario_contrasena_hash || "";
+      const ok = verifyPassword(password, stored);
+
+      console.log("[LOGIN] verificación:", ok ? "OK" : "FAIL");
+      if (!ok) return res.status(401).json({ mensaje: "Contraseña incorrecta" });
+
+      // Respuesta tipo UsuarioDto (lo que espera tu app)
+      return res.json({
+        id_usuario: u.id_usuario,
+        usuario_nombre: u.usuario_nombre,
+        usuario_apellido: u.usuario_apellido,
+        usuario_correo: u.usuario_correo,
+        usuario_tipo: u.usuario_tipo,
+      });
+    });
+  } catch (e) {
+    console.error("[LOGIN] exception:", e);
+    return res.status(500).json({ mensaje: "Error inesperado" });
+  }
 });
 
 // Registrar paciente
