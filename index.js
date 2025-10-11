@@ -458,7 +458,7 @@ app.get("/horarios/:parametro", (req, res) => {
 });
 
 app.post("/horario/registrar", (req, res) => {
-  const { id_medico, horario_horas, horario_fecha, id_especialidad } = req.body;
+  let { id_medico, horario_horas, horario_fecha, id_especialidad } = req.body;
   horario_fecha = toYYYYMMDD(horario_fecha);
   if (!id_medico || !horario_horas || !horario_fecha || !id_especialidad) return res.status(400).json({ error: "Faltan datos obligatorios" });
   const horario_estado = 0;
@@ -538,7 +538,7 @@ app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", (req, res) =
 /* ===================== CITAS ===================== */
 
 app.post("/cita/agregar", (req, res) => {
-  const { id_usuario, id_medico, cita_fecha, cita_hora } = req.body;
+  let { id_usuario, id_medico, cita_fecha, cita_hora } = req.body;
   cita_fecha = toYYYYMMDD(cita_fecha);
 
   const qOrden = "SELECT COUNT(*) AS total FROM citas WHERE id_usuario = ?";
