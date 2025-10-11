@@ -493,25 +493,64 @@ app.put("/cita/anular/:id_cita", (req, res) => {
   });
 });
 
+// Cancelar por id_usuario + numero_orden (idempotente)
+app.put("/cita/anular/:id_usuario/:numero_orden", (req, res) => {
+  const { id_usuario, numero_orden } = req.params;
+
+  const qSel = `
+    SELECT id_cita, id_medico,
+           DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS cita_fecha,
+           TIME_FORMAT(cita_hora,'%H:%i')     AS cita_hora,
+           cita_estado
+    FROM citas
+    WHERE id_usuario=? AND numero_orden=? 
+    LIMIT 1`;
+  conexion.query(qSel, [id_usuario, numero_orden], (e1, r1) => {
+    if (e1) return res.status(500).json({ error: "Error al buscar la cita" });
+    if (!r1.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
+
+    const { id_cita, id_medico, cita_fecha, cita_hora, cita_estado } = r1[0];
+
+    // si ya estaba cancelada, respondemos 200 (idempotente, para que la UI no se quede colgada)
+    if (Number(cita_estado) === 0) {
+      return res.json({ mensaje: "La cita ya estaba cancelada" });
+    }
+
+    conexion.query("UPDATE citas SET cita_estado=0 WHERE id_cita=?", [id_cita], (e2) => {
+      if (e2) return res.status(500).json({ error: "Error al cancelar la cita" });
+
+      const qLib = `
+        UPDATE horarios_medicos SET horario_estado=0 
+        WHERE id_medico=? 
+          AND horario_fecha=STR_TO_DATE(?, '%Y-%m-%d') 
+          AND horario_hora  =STR_TO_DATE(?, '%H:%i')`;
+      conexion.query(qLib, [id_medico, cita_fecha, cita_hora], () => {
+        res.json({ mensaje: "Cita cancelada y horario liberado correctamente" });
+      });
+    });
+  });
+});
+
 // GET /cita/usuario/:id_usuario/orden/:numero_orden
 app.get("/cita/usuario/:id_usuario/orden/:numero_orden", (req, res) => {
   const { id_usuario, numero_orden } = req.params;
 
   const consulta = `
     SELECT 
-      cit.id_cita AS IdCita,
+      cit.id_cita                                   AS IdCita,
       CONCAT(us.usuario_nombre,' ',us.usuario_apellido) AS UsuarioCita,
-      esp.especialidad_nombre AS Especialidad,
+      esp.especialidad_nombre                       AS Especialidad,
       CONCAT(mu.usuario_nombre,' ',mu.usuario_apellido) AS Medico,
-      DATE_FORMAT(cit.cita_fecha,'%Y-%m-%d') AS FechaCita,
-      TIME_FORMAT(cit.cita_hora,'%H:%i') AS HoraCita,
+      DATE_FORMAT(cit.cita_fecha,'%d/%m/%Y')        AS FechaCita,        -- formato UI
+      DATE_FORMAT(cit.cita_fecha,'%Y-%m-%d')        AS FechaCitaISO,     -- formato ISO
+      TIME_FORMAT(cit.cita_hora,'%H:%i')            AS HoraCita,
       CASE WHEN cit.cita_estado=1 THEN 'Confirmada'
            WHEN cit.cita_estado=0 THEN 'Cancelada'
-           ELSE 'Desconocido' END AS EstadoCita
+           ELSE 'Desconocido' END                   AS EstadoCita
     FROM citas cit
     INNER JOIN usuarios us ON us.id_usuario = cit.id_usuario
-    INNER JOIN medicos m ON m.id_medico = cit.id_medico
-    INNER JOIN usuarios mu ON m.id_medico = mu.id_usuario
+    INNER JOIN medicos m   ON m.id_medico   = cit.id_medico
+    INNER JOIN usuarios mu ON mu.id_usuario = m.id_medico
     INNER JOIN especialidades esp ON esp.id_especialidad = m.id_especialidad
     WHERE cit.id_usuario = ? AND cit.numero_orden = ?
     LIMIT 1`;
@@ -526,16 +565,18 @@ app.get("/cita/usuario/:id_usuario/orden/:numero_orden", (req, res) => {
 app.get("/citamedica/:id_cita", (req, res) => {
   const { id_cita } = req.params;
   const consulta = `
-    SELECT cit.id_cita AS IdCita,
-           CONCAT(us.usuario_nombre,' ',us.usuario_apellido) AS UsuarioCita,
-           esp.especialidad_nombre AS Especialidad,
-           CONCAT(med.usuario_nombre,' ',med.usuario_apellido) AS Medico,
-           DATE_FORMAT(cit.cita_fecha,'%Y-%m-%d') AS FechaCita,
-           TIME_FORMAT(cit.cita_hora,'%H:%i') AS HoraCita
+    SELECT 
+      cit.id_cita                                   AS IdCita,
+      CONCAT(us.usuario_nombre,' ',us.usuario_apellido) AS UsuarioCita,
+      esp.especialidad_nombre                       AS Especialidad,
+      CONCAT(med.usuario_nombre,' ',med.usuario_apellido) AS Medico,
+      DATE_FORMAT(cit.cita_fecha,'%d/%m/%Y')        AS FechaCita,     -- UI
+      DATE_FORMAT(cit.cita_fecha,'%Y-%m-%d')        AS FechaCitaISO,  -- ISO
+      TIME_FORMAT(cit.cita_hora,'%H:%i')            AS HoraCita
     FROM citas cit
-    INNER JOIN usuarios us  ON us.id_usuario = cit.id_usuario
-    INNER JOIN medicos m    ON m.id_medico   = cit.id_medico
-    INNER JOIN usuarios med ON med.id_usuario= m.id_medico
+    INNER JOIN usuarios us  ON us.id_usuario  = cit.id_usuario
+    INNER JOIN medicos m    ON m.id_medico    = cit.id_medico
+    INNER JOIN usuarios med ON med.id_usuario = m.id_medico
     INNER JOIN especialidades esp ON esp.id_especialidad = m.id_especialidad
     WHERE cit.id_cita = ?`;
   conexion.query(consulta, [id_cita], (err, rows) => {
