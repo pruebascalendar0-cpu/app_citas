@@ -43,19 +43,23 @@ app.use((req, res, next) => {
  */
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || "smtp.gmail.com",
-  port: Number(process.env.SMTP_PORT || 587), // 587 suele ir mejor en Render
+  port: Number(process.env.SMTP_PORT || 587),          // 587 recomendado en Render
   secure: String(process.env.SMTP_SECURE || "false") === "true",
   auth: {
     user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD,
+    // quita espacios por si el App Password vino con espacios
+    pass: (process.env.EMAIL_PASSWORD || "").replace(/\s+/g, ""),
   },
   pool: true,
   maxConnections: 3,
   maxMessages: 50,
-  connectionTimeout: 20000,
-  socketTimeout: 30000,
-  logger: true, // logs SMTP
-  debug: true,  // logs detallados
+  connectionTimeout: 30000,  // + tiempo
+  socketTimeout: 45000,      // + tiempo
+  logger: true,
+  debug: true,
+  // Fuerza IPv4 (evita timeouts cuando el proveedor da preferencia a IPv6)
+  family: 4,
+  // tls: { rejectUnauthorized: false }, // déjalo comentado; solo si un proveedor raro lo requiere
 });
 
 const FROM = process.env.EMAIL_FROM || `Clínica Salud Total <${process.env.EMAIL_USER}>`;
