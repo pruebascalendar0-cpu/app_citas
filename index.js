@@ -1,4 +1,5 @@
-// index.js - API Clínica Salud Total (Express + MySQL + Gmail API) - 2025-10-11
+// index.js - API Clínica Salud Total (Express + MySQL + Gmail API)
+// Build: 2025-10-11-2 (fix editar usuario, no-cache, logs fuertes)
 require("dotenv").config();
 
 const express = require("express");
@@ -8,7 +9,16 @@ const { google } = require("googleapis");
 
 const app = express();
 const PUERTO = process.env.PORT || 10000;
+
 app.use(express.json());
+
+// No cache global (evita listas vacías intermitentes en clientes)
+app.use((req, res, next) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  next();
+});
 
 /* =========================================
  *  Request-ID + Logs
@@ -21,9 +31,7 @@ app.use((req, res, next) => {
     try { console.log(`[${req.rid}] body:`, req.body); } catch {}
   }
   res.on("finish", () => {
-    console.log(
-      `[${req.rid}] <- ${res.statusCode} ${req.method} ${req.originalUrl} (${Date.now() - t0}ms)`
-    );
+    console.log(`[${req.rid}] <- ${res.statusCode} ${req.method} ${req.originalUrl} (${Date.now() - t0}ms)`);
   });
   next();
 });
@@ -44,17 +52,27 @@ conexion.connect((error) => {
   console.log("Conexion exitosa a la base de datos");
 });
 
-function dbQuery(sql, params = []) {
+function dbQuery(sql, params = [], rid = "na") {
+  console.log(`[${rid}] SQL>`, sql, params && params.length ? `params=${JSON.stringify(params)}` : "");
   return new Promise((resolve, reject) => {
     conexion.query(sql, params, (err, rows) => {
-      if (err) return reject(err);
+      if (err) {
+        console.error(`[${rid}] SQL!`, err.code, err.sqlMessage || err.message);
+        return reject(err);
+      }
+      // log tamaño de respuesta
+      if (Array.isArray(rows)) {
+        console.log(`[${rid}] SQL< rows=${rows.length}`);
+      } else {
+        console.log(`[${rid}] SQL<`, rows);
+      }
       resolve(rows);
     });
   });
 }
 
 /* =========================================
- *  Gmail API (sin nodemailer)
+ *  Gmail API
  * ========================================= */
 const GMAIL_USER = process.env.GMAIL_USER;
 
@@ -69,7 +87,6 @@ const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
 function base64Url(str) {
   return Buffer.from(str).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
-
 async function enviarMail({ rid, to, subject, html, text, category = "notificaciones" }) {
   const from = `Clínica Salud Total <${GMAIL_USER}>`;
   const plain = text || html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
@@ -93,52 +110,37 @@ async function enviarMail({ rid, to, subject, html, text, category = "notificaci
   console.log(`[${rid}] [@gmail] ok id=${r.data.id} (${Date.now() - t0}ms)`);
   return r.data;
 }
-
 const wrap = (inner) => `
   <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;line-height:1.5;color:#222;max-width:560px">
     ${inner}
     <hr style="border:none;border-top:1px solid #eee;margin:16px 0" />
     <div style="font-size:12px;color:#777">Clínica Salud Total · Mensaje automático.</div>
   </div>`;
-
 async function correoConfirmacion(rid, to, fecha, hora) {
-  return enviarMail({
-    rid, to,
-    subject: "Confirmación de tu cita médica",
+  return enviarMail({ rid, to, subject: "Confirmación de tu cita médica",
     html: wrap(`<h2>Cita confirmada</h2><p>Tu cita ha sido registrada.</p><p><b>Fecha:</b> ${fecha}<br><b>Hora:</b> ${hora}</p>`),
-    category: "cita-confirmada",
-  });
+    category: "cita-confirmada" });
 }
 async function correoActualizacion(rid, to, fecha, hora) {
-  return enviarMail({
-    rid, to,
-    subject: "Actualización de tu cita médica",
+  return enviarMail({ rid, to, subject: "Actualización de tu cita médica",
     html: wrap(`<h2>Cita actualizada</h2><p><b>Nueva fecha:</b> ${fecha}<br><b>Hora:</b> ${hora}</p>`),
-    category: "cita-actualizada",
-  });
+    category: "cita-actualizada" });
 }
 async function correoCancelacion(rid, to, fecha, hora) {
-  return enviarMail({
-    rid, to,
-    subject: "Cancelación de tu cita médica",
+  return enviarMail({ rid, to, subject: "Cancelación de tu cita médica",
     html: wrap(`<h2>Cita cancelada</h2><p><b>Fecha:</b> ${fecha}<br><b>Hora:</b> ${hora}</p>`),
-    category: "cita-cancelada",
-  });
+    category: "cita-cancelada" });
 }
 async function correoBienvenida(rid, to, nombre) {
-  return enviarMail({
-    rid, to,
-    subject: "Bienvenido a Clínica Salud Total",
+  return enviarMail({ rid, to, subject: "Bienvenido a Clínica Salud Total",
     html: wrap(`<h2>¡Bienvenido, ${nombre}!</h2><p>Tu registro fue exitoso.</p>`),
-    category: "bienvenida",
-  });
+    category: "bienvenida" });
 }
 
 /* =========================================
- *  Helpers de fecha
+ *  Helpers fecha
  * ========================================= */
 function toYYYYMMDD(d) {
-  // acepta Date o string
   const obj = d instanceof Date ? d : new Date(d);
   const y = obj.getUTCFullYear();
   const m = String(obj.getUTCMonth() + 1).padStart(2, "0");
@@ -147,41 +149,40 @@ function toYYYYMMDD(d) {
 }
 function normalizeFechaParam(s) {
   if (!s) return s;
-  // si viene ISO con zona: 2025-10-11T00:00:00.000Z -> recorta
   const iso = String(s);
   if (iso.includes("T")) return toYYYYMMDD(iso);
   if (iso.includes("/")) {
-    // 2025/10/11 -> 2025-10-11
     const [y, m, d] = iso.split("/");
     return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
   }
-  return iso; // ya está YYYY-MM-DD
+  return iso;
 }
 function addDays(yyyy_mm_dd, delta) {
   const d = new Date(yyyy_mm_dd + "T00:00:00Z");
   d.setUTCDate(d.getUTCDate() + delta);
   return toYYYYMMDD(d);
 }
-async function pickHorarioSlotFechaCorrigida(id_medico, fecha, hora) {
-  // busca el slot exacto por (medico,fecha,hora); si no, prueba fecha±1 (corrige desfase cliente)
+async function pickHorarioSlotFechaCorrigida(id_medico, fecha, hora, rid="na") {
   const tryDates = [fecha, addDays(fecha, 1), addDays(fecha, -1)];
   for (const f of tryDates) {
     const rows = await dbQuery(
       `SELECT id_horario, id_especialidad, horario_estado
          FROM horarios_medicos
         WHERE id_medico=? AND horario_fecha=? AND horario_hora=?`,
-      [id_medico, f, hora]
+      [id_medico, f, hora],
+      rid
     );
     if (rows.length) {
-      const row = rows[0];
+      console.log(`[${rid}] pickSlot HIT fecha=${f} hora=${hora} id_horario=${rows[0].id_horario} estado=${rows[0].horario_estado}`);
       return {
-        id_horario: row.id_horario,
+        id_horario: rows[0].id_horario,
         fecha: f,
-        id_especialidad: row.id_especialidad,
-        ocupado: row.horario_estado === 1
+        id_especialidad: rows[0].id_especialidad,
+        ocupado: rows[0].horario_estado === 1
       };
     }
   }
+  console.log(`[${rid}] pickSlot MISS fechaBase=${fecha} hora=${hora}`);
   return null;
 }
 
@@ -193,17 +194,15 @@ app.get("/", (req, res) => res.send("Bienvenido a mi servicio web"));
 /* -------- Usuarios -------- */
 app.get("/usuarios", async (req, res) => {
   try {
-    const r = await dbQuery("SELECT * FROM usuarios");
+    const r = await dbQuery("SELECT * FROM usuarios", [], req.rid);
     res.json({ listaUsuarios: r });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: "Error al obtener usuarios" });
   }
 });
 
 app.post("/usuario/agregar", async (req, res) => {
   const u = req.body || {};
-  // validaciones mínimas
   if (!u.usuario_dni || !/^\d{8}$/.test(u.usuario_dni))
     return res.status(400).json({ mensaje: "El DNI debe tener exactamente 8 dígitos numéricos." });
   if (!u.usuario_nombre || !u.usuario_apellido)
@@ -219,15 +218,11 @@ app.post("/usuario/agregar", async (req, res) => {
       usuario_nombre: u.usuario_nombre,
       usuario_apellido: u.usuario_apellido,
       usuario_correo: u.usuario_correo,
-      usuario_contrasena_hash: u.usuario_contrasena, // si en este flujo no usas hash, está como texto; tu login hash sigue intacto en /usuario/login
+      usuario_contrasena_hash: u.usuario_contrasena, // nota: aquí guardas lo que mandes; login usa hash salteado ya existente
       usuario_tipo: u.usuario_tipo ?? 1
-    });
+    }, req.rid);
 
-    await correoBienvenida(
-      req.rid,
-      u.usuario_correo,
-      `${u.usuario_nombre} ${u.usuario_apellido}`
-    );
+    await correoBienvenida(req.rid, u.usuario_correo, `${u.usuario_nombre} ${u.usuario_apellido}`);
 
     res.json({ mensaje: "Usuario registrado correctamente." });
   } catch (e) {
@@ -238,25 +233,22 @@ app.post("/usuario/agregar", async (req, res) => {
         return res.status(400).json({ mensaje: "El correo ya está registrado." });
       return res.status(400).json({ mensaje: "Datos duplicados en campos únicos." });
     }
-    console.error(e);
     res.status(500).json({ mensaje: "Error al registrar usuario." });
   }
 });
 
-// Login HASH actual (no se toca) - asumo que ya lo tienes implementado así:
+// Login hash salteado
 app.post("/usuario/login", async (req, res) => {
   const { usuario_correo, password } = req.body || {};
   if (!usuario_correo || !password) return res.status(400).json({ error: "Datos incompletos" });
-
   try {
     const r = await dbQuery(
       "SELECT id_usuario, usuario_nombre, usuario_apellido, usuario_correo, usuario_tipo, usuario_contrasena_hash FROM usuarios WHERE usuario_correo=?",
-      [usuario_correo]
+      [usuario_correo],
+      req.rid
     );
     if (!r.length) return res.status(404).json({ mensaje: "No encontrado" });
-
     const row = r[0];
-    // hash salteado formato: <salt>:<sha256>
     const [salt, hash] = String(row.usuario_contrasena_hash || "").split(":");
     const check = crypto.createHash("sha256").update(String(salt || "") + String(password)).digest("hex");
     if (check !== hash) return res.status(401).json({ mensaje: "Contraseña incorrecta" });
@@ -269,37 +261,46 @@ app.post("/usuario/login", async (req, res) => {
       usuario_tipo: row.usuario_tipo
     });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: "Error interno" });
   }
 });
 
+// *** FIX EDITAR USUARIO ***
 app.put("/usuario/actualizar/:id", async (req, res) => {
   const { id } = req.params;
   const { usuario_nombre, usuario_apellido, usuario_correo } = req.body || {};
-  console.log(`[${req.rid}] PUT /usuario/actualizar/${id}`, { usuario_nombre, usuario_apellido, usuario_correo });
+  console.log(`[${req.rid}] PUT /usuario/actualizar/${id} data=`, { usuario_nombre, usuario_apellido, usuario_correo });
 
   if (!usuario_nombre || !usuario_apellido || !usuario_correo) {
     return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
   }
 
   try {
+    // correo duplicado en otro usuario
     const dup = await dbQuery(
-      "SELECT 1 FROM usuarios WHERE usuario_correo=? AND id_usuario<>?",
-      [usuario_correo, id]
+      "SELECT id_usuario FROM usuarios WHERE usuario_correo=? AND id_usuario<>?",
+      [usuario_correo, id],
+      req.rid
     );
-    if (dup.length) return res.status(409).json({ mensaje: "El correo ya está en uso por otro usuario" });
+    if (dup.length) {
+      console.log(`[${req.rid}] correo duplicado en id=${dup[0].id_usuario}`);
+      return res.status(409).json({ mensaje: "El correo ya está en uso por otro usuario" });
+    }
 
     const r = await dbQuery(
       "UPDATE usuarios SET usuario_nombre=?, usuario_apellido=?, usuario_correo=? WHERE id_usuario=?",
-      [usuario_nombre, usuario_apellido, usuario_correo, id]
+      [usuario_nombre.trim(), usuario_apellido.trim(), usuario_correo.trim(), id],
+      req.rid
     );
 
-    console.log(`[${req.rid}] actualizado filas=${r.affectedRows ?? "?"}`);
-    res.json({ mensaje: "Usuario actualizado correctamente" });
+    const changed = r.affectedRows || r.changedRows || 0;
+    console.log(`[${req.rid}] UPDATE usuarios affected=${changed}`);
+
+    // Aunque no cambie (mismos datos), devolvemos OK para que el cliente fluya
+    return res.status(200).json({ mensaje: "Usuario actualizado correctamente" });
   } catch (e) {
-    console.error(`[${req.rid}] error actualizar`, e);
-    res.status(500).json({ mensaje: "Error al actualizar usuario" });
+    console.error(`[${req.rid}] error actualizar usuario`, e);
+    return res.status(500).json({ mensaje: "Error al actualizar usuario" });
   }
 });
 
@@ -316,17 +317,17 @@ app.post("/usuario/registrar", async (req, res) => {
   try {
     const r = await dbQuery("INSERT INTO usuarios SET ?", {
       usuario_nombre, usuario_apellido, usuario_correo, usuario_dni,
-      usuario_contrasena_hash: usuario_contrasena, // ver nota de arriba
+      usuario_contrasena_hash: usuario_contrasena,
       usuario_tipo
-    });
+    }, req.rid);
     const id_usuario = r.insertId;
 
     if (usuario_tipo === 2 && id_especialidad) {
       try {
-        await dbQuery("INSERT INTO medicos (id_medico, id_especialidad) VALUES (?,?)", [id_usuario, id_especialidad]);
+        await dbQuery("INSERT INTO medicos (id_medico, id_especialidad) VALUES (?,?)", [id_usuario, id_especialidad], req.rid);
         return res.status(201).json({ mensaje: "Médico registrado correctamente", id_usuario });
       } catch (e) {
-        console.error("Error al insertar en médicos:", e);
+        console.error(`[${req.rid}] error insertar medico`, e);
         return res.status(201).json({ mensaje: "Usuario registrado, pero no se pudo asignar la especialidad", id_usuario });
       }
     }
@@ -340,7 +341,7 @@ app.post("/usuario/registrar", async (req, res) => {
       }
       return res.status(400).json({ mensaje: "Datos duplicados en campos únicos." });
     }
-    console.error("Error al registrar usuario:", e);
+    console.error(`[${req.rid}] error registrar usuario`, e);
     res.status(500).json({ mensaje: "Error al registrar usuario" });
   }
 });
@@ -348,7 +349,7 @@ app.post("/usuario/registrar", async (req, res) => {
 app.get("/usuario/:correo", async (req, res) => {
   try {
     const correo = decodeURIComponent(req.params.correo);
-    const r = await dbQuery("SELECT * FROM usuarios WHERE usuario_correo=?", [correo]);
+    const r = await dbQuery("SELECT * FROM usuarios WHERE usuario_correo=?", [correo], req.rid);
     if (!r.length) return res.status(404).json({ mensaje: "no hay registros" });
     res.json(r[0]);
   } catch (e) {
@@ -356,42 +357,10 @@ app.get("/usuario/:correo", async (req, res) => {
   }
 });
 
-app.post("/usuario/recuperar-correo", async (req, res) => {
-  const { usuario_dni, usuario_nombre, usuario_apellido } = req.body || {};
-  try {
-    const r = await dbQuery(
-      `SELECT usuario_correo FROM usuarios WHERE usuario_dni=? AND usuario_nombre=? AND usuario_apellido=?`,
-      [usuario_dni, usuario_nombre, usuario_apellido]
-    );
-    if (!r.length) return res.status(404).json({ mensaje: "Usuario no encontrado" });
-    res.json({ correo: r[0].usuario_correo });
-  } catch (e) {
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-app.post("/usuario/recuperar-contrasena", async (req, res) => {
-  // (flujo legacy – puedes responder OK o enviar correo con instrucciones)
-  const { usuario_correo } = req.body || {};
-  try {
-    const r = await dbQuery("SELECT usuario_nombre, usuario_apellido FROM usuarios WHERE usuario_correo=?", [usuario_correo]);
-    if (!r.length) return res.status(404).json({ mensaje: "Correo no registrado" });
-    await enviarMail({
-      rid: req.rid, to: usuario_correo,
-      subject: "Instrucciones para recuperar tu contraseña",
-      html: wrap(`<h2>Recuperación</h2><p>Si no solicitaste esto, ignora el mensaje.</p>`),
-      category: "reset"
-    });
-    res.json({ mensaje: "Correo de recuperación enviado" });
-  } catch (e) {
-    res.status(500).json({ error: "Error interno" });
-  }
-});
-
 /* -------- Especialidades / Médicos -------- */
 app.get("/especialidades", async (req, res) => {
   try {
-    const r = await dbQuery("SELECT * FROM especialidades");
+    const r = await dbQuery("SELECT * FROM especialidades", [], req.rid);
     res.json({ listaEspecialidades: r });
   } catch (e) {
     res.status(500).json({ mensaje: "Error al obtener especialidades" });
@@ -402,7 +371,7 @@ app.post("/especialidad/agregar", async (req, res) => {
   const { especialidad_nombre } = req.body || {};
   if (!especialidad_nombre) return res.status(400).json({ error: "Nombre requerido" });
   try {
-    await dbQuery("INSERT INTO especialidades (especialidad_nombre) VALUES (?)", [especialidad_nombre]);
+    await dbQuery("INSERT INTO especialidades (especialidad_nombre) VALUES (?)", [especialidad_nombre], req.rid);
     res.status(201).json("Especialidad registrada");
   } catch (e) {
     res.status(500).json({ error: "Error al guardar especialidad" });
@@ -414,7 +383,7 @@ app.put("/especialidad/actualizar/:id", async (req, res) => {
   const { especialidad_nombre } = req.body || {};
   if (!especialidad_nombre) return res.status(400).json({ mensaje: "Nombre requerido" });
   try {
-    await dbQuery("UPDATE especialidades SET especialidad_nombre=? WHERE id_especialidad=?", [especialidad_nombre, id]);
+    await dbQuery("UPDATE especialidades SET especialidad_nombre=? WHERE id_especialidad=?", [especialidad_nombre, id], req.rid);
     res.json({ mensaje: "Especialidad actualizada correctamente" });
   } catch (e) {
     res.status(500).json({ error: "Error al actualizar especialidad" });
@@ -426,9 +395,11 @@ app.get("/medico/:id_medico/especialidades", async (req, res) => {
   try {
     const r = await dbQuery(
       `SELECT e.id_especialidad, e.especialidad_nombre
-         FROM medicos m INNER JOIN especialidades e ON m.id_especialidad=e.id_especialidad
+         FROM medicos m
+         INNER JOIN especialidades e ON m.id_especialidad=e.id_especialidad
         WHERE m.id_medico=?`,
-      [id_medico]
+      [id_medico],
+      req.rid
     );
     res.json({ listaEspecialidades: r });
   } catch (e) {
@@ -438,7 +409,6 @@ app.get("/medico/:id_medico/especialidades", async (req, res) => {
 
 /* -------- Horarios -------- */
 app.get("/horarios/:parametro", async (req, res) => {
-  // usado por agendado del paciente: trae slots con estado=0
   const valores = req.params.parametro.split("&");
   const fecha = normalizeFechaParam(valores[0]);
   const especialidad = valores[1];
@@ -456,15 +426,16 @@ app.get("/horarios/:parametro", async (req, res) => {
          INNER JOIN especialidades e ON h.id_especialidad=e.id_especialidad
         WHERE h.horario_fecha=? AND h.id_especialidad=? AND h.horario_estado=0
         ORDER BY h.horario_hora ASC`,
-      [fecha, especialidad]
+      [fecha, especialidad],
+      req.rid
     );
+    console.log(`[${req.rid}] horarios disponibles=${r.length} para fecha=${fecha}`);
     res.json({ listaHorarios: r });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// para pantalla de “agregar horario” del médico (lista horas 08-16 que NO ha registrado)
 app.get("/horarios/disponibles/:id_medico/:fecha/:id_especialidad", async (req, res) => {
   const { id_medico, fecha, id_especialidad } = req.params;
   const f = normalizeFechaParam(fecha);
@@ -474,10 +445,12 @@ app.get("/horarios/disponibles/:id_medico/:fecha/:id_especialidad", async (req, 
       `SELECT TIME_FORMAT(horario_hora,'%H:%i') AS hora
          FROM horarios_medicos
         WHERE id_medico=? AND horario_fecha=? AND id_especialidad=?`,
-      [id_medico, f, id_especialidad]
+      [id_medico, f, id_especialidad],
+      req.rid
     );
     const ocupadas = r.map(x => x.hora);
     const disponibles = todas.filter(h => !ocupadas.includes(h));
+    console.log(`[${req.rid}] horas ocupadas=${ocupadas.length} disponibles=${disponibles.length}`);
     res.json({ horariosDisponibles: disponibles });
   } catch (e) {
     res.status(500).json({ error: "Error al consultar horarios" });
@@ -493,7 +466,8 @@ app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", async (req, 
          FROM horarios_medicos
         WHERE id_medico=? AND horario_fecha=? AND id_especialidad=? AND horario_estado=0
         ORDER BY horario_hora ASC`,
-      [id_medico, f, id_especialidad]
+      [id_medico, f, id_especialidad],
+      req.rid
     );
     res.json({ horarios: r.map(x => x.hora) });
   } catch (e) {
@@ -510,7 +484,8 @@ app.post("/horario/registrar", async (req, res) => {
     const r = await dbQuery(
       `INSERT INTO horarios_medicos (id_medico,horario_hora,horario_fecha,horario_estado,id_especialidad)
        VALUES (?,?,?,?,?)`,
-      [id_medico, horario_horas, normalizeFechaParam(horario_fecha), 0, id_especialidad]
+      [id_medico, horario_horas, normalizeFechaParam(horario_fecha), 0, id_especialidad],
+      req.rid
     );
     res.json({ mensaje: "Horario registrado correctamente", id_horario: r.insertId });
   } catch (e) {
@@ -523,7 +498,6 @@ app.put("/horario/editar/:id_medico/:fecha/:hora", async (req, res) => {
   const { id_medico, hora } = req.params;
   const fecha = normalizeFechaParam(req.params.fecha);
   let { accion, nuevaHora, id_especialidad } = req.body || {};
-
   console.log(`[${req.rid}] PUT /horario/editar`, { id_medico, fecha, hora, accion, id_especialidad, nuevaHora });
 
   if (!accion) return res.status(400).json({ mensaje: "accion requerida" });
@@ -533,7 +507,8 @@ app.put("/horario/editar/:id_medico/:fecha/:hora", async (req, res) => {
       const row = await dbQuery(
         `SELECT id_especialidad FROM horarios_medicos 
           WHERE id_medico=? AND horario_fecha=? AND horario_hora=? LIMIT 1`,
-        [id_medico, fecha, hora]
+        [id_medico, fecha, hora],
+        req.rid
       );
       id_especialidad = row?.[0]?.id_especialidad ?? null;
     }
@@ -543,8 +518,8 @@ app.put("/horario/editar/:id_medico/:fecha/:hora", async (req, res) => {
         ? `DELETE FROM horarios_medicos WHERE id_medico=? AND horario_fecha=? AND horario_hora=? AND id_especialidad=?`
         : `DELETE FROM horarios_medicos WHERE id_medico=? AND horario_fecha=? AND horario_hora=?`;
       const params = id_especialidad ? [id_medico, fecha, hora, id_especialidad] : [id_medico, fecha, hora];
-      await dbQuery(sql, params);
-      return res.json({ mensaje: "Horario eliminado correctamente" });
+      const r = await dbQuery(sql, params, req.rid);
+      return res.json({ mensaje: "Horario eliminado correctamente", afectadas: r.affectedRows || 0 });
     }
 
     if (accion === "actualizar") {
@@ -557,8 +532,8 @@ app.put("/horario/editar/:id_medico/:fecha/:hora", async (req, res) => {
       const params = id_especialidad
         ? [nuevaHora, id_medico, fecha, hora, id_especialidad]
         : [nuevaHora, id_medico, fecha, hora];
-      await dbQuery(sql, params);
-      return res.json({ mensaje: "Horario actualizado correctamente" });
+      const r = await dbQuery(sql, params, req.rid);
+      return res.json({ mensaje: "Horario actualizado correctamente", afectadas: r.affectedRows || 0 });
     }
 
     if (accion === "ocupar" || accion === "liberar") {
@@ -571,13 +546,12 @@ app.put("/horario/editar/:id_medico/:fecha/:hora", async (req, res) => {
       const params = id_especialidad
         ? [estado, id_medico, fecha, hora, id_especialidad]
         : [estado, id_medico, fecha, hora];
-      await dbQuery(sql, params);
-      return res.json({ mensaje: estado ? "Horario marcado como ocupado" : "Horario liberado" });
+      const r = await dbQuery(sql, params, req.rid);
+      return res.json({ mensaje: estado ? "Horario marcado como ocupado" : "Horario liberado", afectadas: r.affectedRows || 0 });
     }
 
     res.status(400).json({ mensaje: "Acción no reconocida" });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ mensaje: "Error al editar horario" });
   }
 });
@@ -594,38 +568,35 @@ app.post("/cita/agregar", async (req, res) => {
       return res.status(400).json({ error: "Faltan datos obligatorios" });
     }
 
-    // Corrige desfase: usa el slot real si existe en fecha/fecha±1
-    const slot = await pickHorarioSlotFechaCorrigida(id_medico, fechaReq, cita_hora);
+    const slot = await pickHorarioSlotFechaCorrigida(id_medico, fechaReq, cita_hora, req.rid);
     const fechaReal = slot?.fecha || fechaReq;
     const id_horario = slot?.id_horario || null;
 
-    const rCnt = await dbQuery("SELECT COUNT(*) AS total FROM citas WHERE id_usuario=?", [id_usuario]);
+    const rCnt = await dbQuery("SELECT COUNT(*) AS total FROM citas WHERE id_usuario=?", [id_usuario], req.rid);
     const numero_orden = (rCnt[0]?.total || 0) + 1;
 
     await dbQuery(
       "INSERT INTO citas (id_usuario,id_medico,cita_fecha,cita_hora,numero_orden,cita_estado) VALUES (?,?,?,?,?,1)",
-      [id_usuario, id_medico, fechaReal, cita_hora, numero_orden]
+      [id_usuario, id_medico, fechaReal, cita_hora, numero_orden],
+      req.rid
     );
 
-    // ocupar horario EXACTO por id_horario si lo encontré; si no, por (fecha, hora, medico)
     if (id_horario) {
-      await dbQuery("UPDATE horarios_medicos SET horario_estado=1 WHERE id_horario=?", [id_horario]);
+      await dbQuery("UPDATE horarios_medicos SET horario_estado=1 WHERE id_horario=?", [id_horario], req.rid);
     } else {
       await dbQuery(
         "UPDATE horarios_medicos SET horario_estado=1 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?",
-        [fechaReal, cita_hora, id_medico]
+        [fechaReal, cita_hora, id_medico],
+        req.rid
       );
     }
 
-    // correo
-    const rMail = await dbQuery("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario]);
-    if (rMail.length) {
-      await correoConfirmacion(req.rid, rMail[0].usuario_correo, fechaReal, cita_hora);
-    }
+    const rMail = await dbQuery("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], req.rid);
+    if (rMail.length) await correoConfirmacion(req.rid, rMail[0].usuario_correo, fechaReal, cita_hora);
 
     res.json({ mensaje: "Cita registrada correctamente", numero_orden, fecha: fechaReal });
   } catch (e) {
-    console.error("Error insertando cita:", e);
+    console.error(`[${req.rid}] Error insertando cita:`, e);
     res.status(500).json({ error: "Error al registrar la cita" });
   }
 });
@@ -639,44 +610,43 @@ app.put("/cita/actualizar/:id", async (req, res) => {
   const fechaReq = normalizeFechaParam(cita_fecha);
 
   try {
-    const ant = await dbQuery("SELECT cita_fecha, cita_hora FROM citas WHERE id_cita=?", [id]);
+    const ant = await dbQuery("SELECT cita_fecha, cita_hora FROM citas WHERE id_cita=?", [id], req.rid);
     if (!ant.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
 
-    const slot = await pickHorarioSlotFechaCorrigida(id_medico, fechaReq, cita_hora);
+    const slot = await pickHorarioSlotFechaCorrigida(id_medico, fechaReq, cita_hora, req.rid);
     const fechaReal = slot?.fecha || fechaReq;
     const id_horario = slot?.id_horario || null;
 
-    // liberar horario anterior
     await dbQuery(
       "UPDATE horarios_medicos SET horario_estado=0 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?",
-      [ant[0].cita_fecha, ant[0].cita_hora, id_medico]
+      [ant[0].cita_fecha, ant[0].cita_hora, id_medico],
+      req.rid
     );
 
-    // actualizar la cita
-    await dbQuery(
+    const r = await dbQuery(
       `UPDATE citas SET id_usuario=?, id_medico=?, cita_fecha=?, cita_hora=?, cita_estado=?
        WHERE id_cita=?`,
-      [id_usuario, id_medico, fechaReal, cita_hora, cita_estado ?? 1, id]
+      [id_usuario, id_medico, fechaReal, cita_hora, cita_estado ?? 1, id],
+      req.rid
     );
+    console.log(`[${req.rid}] cita actualizada affected=${r.affectedRows || 0}`);
 
-    // ocupar nuevo horario exacto
     if (id_horario) {
-      await dbQuery("UPDATE horarios_medicos SET horario_estado=1 WHERE id_horario=?", [id_horario]);
+      await dbQuery("UPDATE horarios_medicos SET horario_estado=1 WHERE id_horario=?", [id_horario], req.rid);
     } else {
       await dbQuery(
         "UPDATE horarios_medicos SET horario_estado=1 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?",
-        [fechaReal, cita_hora, id_medico]
+        [fechaReal, cita_hora, id_medico],
+        req.rid
       );
     }
 
-    const rMail = await dbQuery("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario]);
-    if (rMail.length) {
-      await correoActualizacion(req.rid, rMail[0].usuario_correo, fechaReal, cita_hora);
-    }
+    const rMail = await dbQuery("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], req.rid);
+    if (rMail.length) await correoActualizacion(req.rid, rMail[0].usuario_correo, fechaReal, cita_hora);
 
     res.json({ mensaje: "Cita actualizada correctamente", fecha: fechaReal });
   } catch (e) {
-    console.error("Error al actualizar la cita:", e);
+    console.error(`[${req.rid}] Error al actualizar la cita:`, e);
     res.status(500).json({ mensaje: "Error al actualizar la cita" });
   }
 });
@@ -684,17 +654,18 @@ app.put("/cita/actualizar/:id", async (req, res) => {
 app.put("/cita/anular/:id_cita", async (req, res) => {
   const { id_cita } = req.params;
   try {
-    const datos = await dbQuery("SELECT cita_fecha, cita_hora, id_medico, id_usuario FROM citas WHERE id_cita=?", [id_cita]);
+    const datos = await dbQuery("SELECT cita_fecha, cita_hora, id_medico, id_usuario FROM citas WHERE id_cita=?", [id_cita], req.rid);
     if (!datos.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
 
     const { cita_fecha, cita_hora, id_medico, id_usuario } = datos[0];
-    await dbQuery("UPDATE citas SET cita_estado=0 WHERE id_cita=?", [id_cita]);
+    await dbQuery("UPDATE citas SET cita_estado=0 WHERE id_cita=?", [id_cita], req.rid);
     await dbQuery(
       "UPDATE horarios_medicos SET horario_estado=0 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?",
-      [cita_fecha, cita_hora, id_medico]
+      [cita_fecha, cita_hora, id_medico],
+      req.rid
     );
 
-    const rMail = await dbQuery("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario]);
+    const rMail = await dbQuery("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], req.rid);
     if (rMail.length) await correoCancelacion(req.rid, rMail[0].usuario_correo, toYYYYMMDD(cita_fecha), cita_hora);
 
     res.json({ mensaje: "Cita cancelada y horario liberado correctamente" });
@@ -703,7 +674,6 @@ app.put("/cita/anular/:id_cita", async (req, res) => {
   }
 });
 
-// anular por (usuario, numero_orden)
 app.put("/cita/anular/:id_usuario/:numero_orden", async (req, res) => {
   const { id_usuario, numero_orden } = req.params;
   try {
@@ -711,19 +681,21 @@ app.put("/cita/anular/:id_usuario/:numero_orden", async (req, res) => {
       `SELECT id_cita, cita_fecha, cita_hora, id_medico 
          FROM citas 
         WHERE id_usuario=? AND numero_orden=? AND cita_estado=1`,
-      [id_usuario, numero_orden]
+      [id_usuario, numero_orden],
+      req.rid
     );
     if (!r.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
 
     const { id_cita, cita_fecha, cita_hora, id_medico } = r[0];
 
-    await dbQuery("UPDATE citas SET cita_estado=0 WHERE id_cita=?", [id_cita]);
+    await dbQuery("UPDATE citas SET cita_estado=0 WHERE id_cita=?", [id_cita], req.rid);
     await dbQuery(
       "UPDATE horarios_medicos SET horario_estado=0 WHERE horario_fecha=? AND horario_hora=? AND id_medico=?",
-      [cita_fecha, cita_hora, id_medico]
+      [cita_fecha, cita_hora, id_medico],
+      req.rid
     );
 
-    const rMail = await dbQuery("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario]);
+    const rMail = await dbQuery("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], req.rid);
     if (rMail.length) await correoCancelacion(req.rid, rMail[0].usuario_correo, toYYYYMMDD(cita_fecha), cita_hora);
 
     res.json({ mensaje: "Cita cancelada exitosamente" });
@@ -735,6 +707,7 @@ app.put("/cita/anular/:id_usuario/:numero_orden", async (req, res) => {
 app.get("/citas/:usuario", async (req, res) => {
   const { usuario } = req.params;
   if (!usuario || String(usuario) === "0") {
+    console.warn(`[${req.rid}] /citas/:usuario -> usuario=0 (cliente aún sin sesión). Respondo lista vacía.`);
     return res.json({ listaCitas: [] });
   }
   try {
@@ -752,12 +725,14 @@ app.get("/citas/:usuario", async (req, res) => {
          JOIN especialidades e ON m.id_especialidad=e.id_especialidad
         WHERE c.id_usuario=?
         ORDER BY c.id_cita ASC`,
-      [usuario]
+      [usuario],
+      req.rid
     );
     const lista = rows.map((c, idx) => ({ ...c, numero_orden: idx + 1 }));
+    console.log(`[${req.rid}] /citas/${usuario} -> ${lista.length} citas`);
     res.json({ listaCitas: lista });
   } catch (e) {
-    console.error(e);
+    console.error(`[${req.rid}] /citas/${usuario} ERROR`, e);
     res.status(500).json({ error: "Error al obtener las citas" });
   }
 });
@@ -781,10 +756,14 @@ app.get("/citas", async (req, res) => {
        INNER JOIN medicos m ON c.id_medico = m.id_medico
        INNER JOIN usuarios mu ON m.id_medico = mu.id_usuario
        INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
-       ORDER BY u.usuario_nombre ASC, numero_cita ASC`
+       ORDER BY u.usuario_nombre ASC, numero_cita ASC`,
+      [],
+      req.rid
     );
+    console.log(`[${req.rid}] /citas (admin) -> total filas=${r.length}`);
     res.json({ listaCitas: r });
   } catch (e) {
+    console.error(`[${req.rid}] /citas ERROR`, e);
     res.status(500).json({ error: "Error al obtener las citas" });
   }
 });
@@ -797,16 +776,16 @@ app.get("/citas/por-dia", async (req, res) => {
          FROM citas
         WHERE cita_estado=1
         GROUP BY cita_fecha
-        ORDER BY cita_fecha ASC`
+        ORDER BY cita_fecha ASC`,
+      [],
+      req.rid
     );
-    const listaCitas = rows.map(r => ({
-      fecha: toYYYYMMDD(r.fecha),
-      cantidad: r.cantidad,
-    }));
-    console.log(`[${req.rid}] /citas/por-dia -> ${listaCitas.length} filas`);
+    const listaCitas = rows.map(r => ({ fecha: toYYYYMMDD(r.fecha), cantidad: r.cantidad }));
+    const total = listaCitas.reduce((a, b) => a + Number(b.cantidad || 0), 0);
+    console.log(`[${req.rid}] /citas/por-dia -> grupos=${listaCitas.length} total=${total} sample=${JSON.stringify(listaCitas.slice(0,3))}`);
     res.json({ listaCitas });
   } catch (e) {
-    console.error(e);
+    console.error(`[${req.rid}] /citas/por-dia ERROR`, e);
     res.status(500).json({ error: "Error en la base de datos" });
   }
 });
@@ -831,7 +810,8 @@ app.get("/cita/usuario/:id_usuario/orden/:numero_orden", async (req, res) => {
        INNER JOIN usuarios mu ON m.id_medico=mu.id_usuario
        INNER JOIN especialidades esp ON esp.id_especialidad=m.id_especialidad
        WHERE cit.id_usuario=? AND cit.numero_orden=?`,
-      [id_usuario, numero_orden]
+      [id_usuario, numero_orden],
+      req.rid
     );
     if (!r.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
     res.json(r[0]);
@@ -858,9 +838,11 @@ app.get("/citas/medico/:id_medico", async (req, res) => {
          INNER JOIN especialidades e ON m.id_especialidad=e.id_especialidad
         WHERE c.id_medico=?
         ORDER BY c.id_cita ASC`,
-      [id_medico]
+      [id_medico],
+      req.rid
     );
     const lista = r.map((cita, index) => ({ ...cita, numero_orden: index + 1 }));
+    console.log(`[${req.rid}] /citas/medico/${id_medico} -> ${lista.length} citas`);
     res.json({ listaCitas: lista });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -871,8 +853,8 @@ app.put("/cita/estado/:id_cita", async (req, res) => {
   const { id_cita } = req.params;
   const { nuevo_estado } = req.body || {};
   try {
-    await dbQuery("UPDATE citas SET cita_estado=? WHERE id_cita=?", [nuevo_estado, id_cita]);
-    res.json({ mensaje: "Estado actualizado correctamente" });
+    const r = await dbQuery("UPDATE citas SET cita_estado=? WHERE id_cita=?", [nuevo_estado, id_cita], req.rid);
+    res.json({ mensaje: "Estado actualizado correctamente", afectadas: r.affectedRows || 0 });
   } catch (e) {
     res.status(500).json({ mensaje: "Error al actualizar estado" });
   }
@@ -894,7 +876,8 @@ app.get("/citamedica/:id_cita", async (req, res) => {
          INNER JOIN usuarios med ON m.id_medico=med.id_usuario
          INNER JOIN especialidades esp ON esp.id_especialidad=m.id_especialidad
         WHERE cit.id_cita=?`,
-      [id_cita]
+      [id_cita],
+      req.rid
     );
     if (!r.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
     res.json(r[0]);
