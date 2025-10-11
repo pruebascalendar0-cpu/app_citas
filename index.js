@@ -38,7 +38,7 @@ const pool = mysql.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   connectionLimit: 10,
-  timezone: "Z", // evitamos desplazamientos; devolvemos strings con DATE_FORMAT
+  timezone: "Z", // devolvemos strings con DATE_FORMAT/TIME_FORMAT
 });
 
 (async () => {
@@ -54,17 +54,15 @@ const pool = mysql.createPool({
 })();
 
 /* =========================================
- *  Gmail API (sin Nodemailer)
+ *  Gmail API (OAuth2, sin Nodemailer)
  * ========================================= */
 const GMAIL_USER = process.env.GMAIL_USER;
-
 const oAuth2Client = new google.auth.OAuth2(
   process.env.GMAIL_CLIENT_ID,
   process.env.GMAIL_CLIENT_SECRET,
   process.env.GMAIL_REDIRECT_URI
 );
 oAuth2Client.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
-
 const gmail = google.gmail({ version: "v1", auth: oAuth2Client });
 
 function base64Url(str) {
@@ -147,11 +145,9 @@ async function correoCodigoReset(rid, to, codigo) {
  * ========================================= */
 function sha256Hex(buf) { return crypto.createHash("sha256").update(buf).digest("hex"); }
 function verifyPassword(stored, plain) {
-  // stored = "saltHex:hashHex"
   if (!stored || !stored.includes(":")) return false;
   const [saltHex, hashHex] = stored.split(":");
   const calc = sha256Hex(Buffer.concat([Buffer.from(saltHex, "hex"), Buffer.from(plain)]));
-  // timingSafeEqual
   const a = Buffer.from(hashHex, "hex");
   const b = Buffer.from(calc, "hex");
   return a.length === b.length && crypto.timingSafeEqual(a, b);
@@ -207,10 +203,8 @@ app.post("/usuario/reset/solicitar", async (req, res) => {
     const [rows] = await pool.query("SELECT id_usuario FROM usuarios WHERE usuario_correo=?", [usuario_correo]);
     if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
 
-    // Generar código 6 dígitos y guardar hash del código
     const codigo = Math.floor(100000 + Math.random() * 900000).toString();
     const codeHash = sha256Hex(codigo);
-    // expira hoy 23:59:59 (hora del servidor DB)
     const hoy = new Date();
     const yyyy = hoy.getUTCFullYear();
     const mm = String(hoy.getUTCMonth() + 1).padStart(2, "0");
@@ -281,6 +275,39 @@ app.get("/usuarios", async (req, res) => {
   }
 });
 
+app.get("/usuario", async (req, res) => {
+  // Nuevo: /usuario?correo=...
+  const rid = req.rid;
+  const correo = req.query.correo;
+  if (!correo) return res.status(400).json({ mensaje: "Parámetro 'correo' requerido" });
+  try {
+    const sql = "SELECT * FROM usuarios WHERE usuario_correo=?";
+    console.log(`[${rid}] SQL> ${sql} params=["${correo}"]`);
+    const [rows] = await pool.query(sql, [correo]);
+    if (!rows.length) return res.status(404).json({ mensaje: "no hay registros" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error(`[${rid}] /usuario?correo ERROR`, e);
+    res.status(500).json({ mensaje: "Error interno" });
+  }
+});
+
+app.get("/usuario/:correo", async (req, res) => {
+  // Compat legacy: /usuario/:correo
+  const rid = req.rid;
+  const correo = decodeURIComponent(req.params.correo);
+  try {
+    const sql = "SELECT * FROM usuarios WHERE usuario_correo=?";
+    console.log(`[${rid}] SQL> ${sql} params=["${correo}"]`);
+    const [rows] = await pool.query(sql, [correo]);
+    if (!rows.length) return res.status(404).json({ mensaje: "no hay registros" });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error(`[${rid}] /usuario/:correo ERROR`, e);
+    res.status(500).json({ mensaje: "Error interno" });
+  }
+});
+
 app.post("/usuario/agregar", async (req, res) => {
   const rid = req.rid;
   try {
@@ -306,10 +333,10 @@ app.post("/usuario/agregar", async (req, res) => {
     const ins = `INSERT INTO usuarios (usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_contrasena_hash,usuario_tipo)
                  VALUES (?,?,?,?,?,?)`;
     console.log(`[${rid}] SQL> ${ins}`);
-    await pool.query(ins, [usuario_nombre, usuario_apellido, usuario_correo, usuario_dni, usuario_contrasena_hash, usuario_tipo]);
+    const [r] = await pool.query(ins, [usuario_nombre, usuario_apellido, usuario_correo, usuario_dni, usuario_contrasena_hash, usuario_tipo]);
 
     await correoBienvenida(rid, usuario_correo, `${usuario_nombre} ${usuario_apellido}`);
-    res.json({ mensaje: "Usuario registrado correctamente." });
+    res.json({ mensaje: "Usuario registrado correctamente.", id_usuario: r.insertId });
   } catch (e) {
     if (e && e.code === "ER_DUP_ENTRY") {
       if (String(e.sqlMessage || "").includes("usuario_dni")) {
@@ -321,6 +348,43 @@ app.post("/usuario/agregar", async (req, res) => {
       return res.status(400).json({ mensaje: "Datos duplicados en campos únicos." });
     }
     console.error(`/usuario/agregar ERROR`, e);
+    res.status(500).json({ mensaje: "Error al registrar usuario." });
+  }
+});
+
+app.post("/usuario/registrar", async (req, res) => {
+  // Registrar usuario y (opcional) crear registro en medicos con id_especialidad
+  const rid = req.rid;
+  try {
+    const {
+      usuario_nombre, usuario_apellido, usuario_correo,
+      usuario_dni, usuario_contrasena, usuario_tipo = 2, // 2 = Médico (por convención)
+      id_especialidad
+    } = req.body || {};
+
+    if (!usuario_dni || !/^\d{8}$/.test(usuario_dni)) {
+      return res.status(400).json({ mensaje: "El DNI debe tener 8 dígitos." });
+    }
+    if (!usuario_nombre || !usuario_apellido || !usuario_correo || !usuario_contrasena) {
+      return res.status(400).json({ mensaje: "Datos de usuario incompletos." });
+    }
+    const usuario_contrasena_hash = newPasswordHash(usuario_contrasena);
+    const insUser = `INSERT INTO usuarios (usuario_nombre,usuario_apellido,usuario_correo,usuario_dni,usuario_contrasena_hash,usuario_tipo)
+                     VALUES (?,?,?,?,?,?)`;
+    const [ru] = await pool.query(insUser, [usuario_nombre, usuario_apellido, usuario_correo, usuario_dni, usuario_contrasena_hash, usuario_tipo]);
+
+    if (usuario_tipo === 2 && id_especialidad) {
+      const insMed = `INSERT INTO medicos (id_medico, id_especialidad) VALUES (?, ?)`;
+      await pool.query(insMed, [ru.insertId, id_especialidad]);
+    }
+
+    await correoBienvenida(rid, usuario_correo, `${usuario_nombre} ${usuario_apellido}`);
+    res.json({ mensaje: "Usuario registrado correctamente.", id_usuario: ru.insertId });
+  } catch (e) {
+    if (e && e.code === "ER_DUP_ENTRY") {
+      return res.status(400).json({ mensaje: "Correo o DNI duplicado." });
+    }
+    console.error(`/usuario/registrar ERROR`, e);
     res.status(500).json({ mensaje: "Error al registrar usuario." });
   }
 });
@@ -350,21 +414,6 @@ app.put("/usuario/actualizar/:id", async (req, res) => {
   }
 });
 
-app.get("/usuario/:correo", async (req, res) => {
-  const rid = req.rid;
-  const correo = decodeURIComponent(req.params.correo);
-  try {
-    const sql = "SELECT * FROM usuarios WHERE usuario_correo=?";
-    console.log(`[${rid}] SQL> ${sql} params=["${correo}"]`);
-    const [rows] = await pool.query(sql, [correo]);
-    if (!rows.length) return res.status(404).json({ mensaje: "no hay registros" });
-    res.json(rows[0]);
-  } catch (e) {
-    console.error(`[${rid}] /usuario/:correo ERROR`, e);
-    res.status(500).json({ mensaje: "Error interno" });
-  }
-});
-
 /* =========================================
  *  ESPECIALIDADES
  * ========================================= */
@@ -380,6 +429,7 @@ app.get("/especialidades", async (req, res) => {
     res.status(500).json({ mensaje: "Error interno" });
   }
 });
+
 app.post("/especialidad/agregar", async (req, res) => {
   const rid = req.rid;
   const { especialidad_nombre } = req.body || {};
@@ -388,12 +438,14 @@ app.post("/especialidad/agregar", async (req, res) => {
     const sql = "INSERT INTO especialidades (especialidad_nombre) VALUES (?)";
     console.log(`[${rid}] SQL> ${sql} params=["${especialidad_nombre}"]`);
     await pool.query(sql, [especialidad_nombre]);
+    // Tu app espera Response<String> aquí; devolvemos string puro:
     res.status(201).json("Especialidad registrada");
   } catch (e) {
     console.error(`[${rid}] /especialidad/agregar ERROR`, e);
     res.status(500).json({ error: "Error al guardar especialidad" });
   }
 });
+
 app.put("/especialidad/actualizar/:id", async (req, res) => {
   const rid = req.rid;
   const { id } = req.params;
@@ -412,34 +464,70 @@ app.put("/especialidad/actualizar/:id", async (req, res) => {
 
 /* =========================================
  *  HORARIOS
- *  (Una sola convención de ruta: /horarios/:fecha/:id_especialidad - libres estado=0)
  * ========================================= */
-app.get("/horarios/:fecha/:id_especialidad", async (req, res) => {
+
+// Disponibles: para registrar nuevas citas (estado=0)
+app.get("/horarios/disponibles/:id_medico/:fecha/:id_especialidad", async (req, res) => {
   const rid = req.rid;
-  const { fecha, id_especialidad } = req.params;
+  const { id_medico, fecha, id_especialidad } = req.params;
   try {
     const sql = `
-      SELECT h.*,
-             TIME_FORMAT(h.horario_hora,'%H:%i') AS horario_horas,
-             u.usuario_nombre AS medico_nombre,
-             u.usuario_apellido AS medico_apellido,
-             e.especialidad_nombre
-        FROM horarios_medicos h
-        INNER JOIN medicos m ON h.id_medico=m.id_medico
-        INNER JOIN usuarios u ON m.id_medico=u.id_usuario
-        INNER JOIN especialidades e ON h.id_especialidad=e.id_especialidad
-       WHERE h.horario_fecha=? AND h.id_especialidad=? AND h.horario_estado=0
-       ORDER BY h.horario_hora ASC`;
-    console.log(`[${rid}] SQL> ${sql} params=["${fecha}","${id_especialidad}"]`);
-    const [rows] = await pool.query(sql, [fecha, id_especialidad]);
-    console.log(`[${rid}] horarios disponibles=${rows.length} para fecha=${fecha}`);
-    res.json({ listaHorarios: rows });
+      SELECT TIME_FORMAT(horario_hora, '%H:%i:%s') AS hora
+        FROM horarios_medicos
+       WHERE id_medico=? AND horario_fecha=? AND id_especialidad=? AND horario_estado=0
+       ORDER BY horario_hora ASC`;
+    console.log(`[${rid}] SQL> ${sql} params=[${id_medico},${fecha},${id_especialidad}]`);
+    const [rows] = await pool.query(sql, [id_medico, fecha, id_especialidad]);
+    res.json({ horariosDisponibles: rows.map(r => r.hora) });
   } catch (e) {
-    console.error(`[${rid}] /horarios ERROR`, e);
-    res.status(500).json({ error: "Error al obtener horarios" });
+    console.error(`[${rid}] /horarios/disponibles ERROR`, e);
+    res.status(500).json({ mensaje: "Error al obtener horarios disponibles" });
   }
 });
 
+// Registrados: para ver/editar/eliminar del médico (todos los estados)
+app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", async (req, res) => {
+  const rid = req.rid;
+  const { id_medico, fecha, id_especialidad } = req.params;
+  try {
+    const sql = `
+      SELECT TIME_FORMAT(horario_hora, '%H:%i:%s') AS hora
+        FROM horarios_medicos
+       WHERE id_medico=? AND horario_fecha=? AND id_especialidad=?
+       ORDER BY horario_hora ASC`;
+    console.log(`[${rid}] SQL> ${sql} params=[${id_medico},${fecha},${id_especialidad}]`);
+    const [rows] = await pool.query(sql, [id_medico, fecha, id_especialidad]);
+    res.json({ horarios: rows.map(r => r.hora) });
+  } catch (e) {
+    console.error(`[${rid}] /horarios/registrados ERROR`, e);
+    res.status(500).json({ mensaje: "Error al obtener horarios" });
+  }
+});
+
+// Registrar horario (evita duplicado por UNIQUE uk_horario_medico)
+app.post("/horario/registrar", async (req, res) => {
+  const rid = req.rid;
+  const { id_medico, id_especialidad, fecha, hora } = req.body || {};
+  if (!id_medico || !id_especialidad || !fecha || !hora) {
+    return res.status(400).json({ mensaje: "Datos incompletos" });
+  }
+  try {
+    const ins = `
+      INSERT INTO horarios_medicos (id_medico, horario_fecha, horario_hora, horario_estado, id_especialidad)
+      VALUES (?, ?, ?, 0, ?)`;
+    console.log(`[${rid}] SQL> ${ins} params=[${id_medico},${fecha},${hora},${id_especialidad}]`);
+    const [r] = await pool.query(ins, [id_medico, fecha, hora, id_especialidad]);
+    res.json({ mensaje: "Horario registrado correctamente", id_horario: r.insertId });
+  } catch (e) {
+    if (e && e.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({ mensaje: "El horario ya existe" });
+    }
+    console.error(`[${rid}] /horario/registrar ERROR`, e);
+    res.status(500).json({ mensaje: "Error al registrar horario" });
+  }
+});
+
+// Editar / Eliminar por clave compuesta
 app.put("/horario/editar/:id_medico/:fecha/:hora", async (req, res) => {
   const rid = req.rid;
   const { id_medico, fecha, hora } = req.params;
@@ -450,36 +538,57 @@ app.put("/horario/editar/:id_medico/:fecha/:hora", async (req, res) => {
   try {
     if (accion === "eliminar") {
       const del = `DELETE FROM horarios_medicos WHERE id_medico=? AND horario_fecha=? AND horario_hora=? AND id_especialidad=?`;
-      await pool.query(del, [id_medico, fecha, hora, id_especialidad]);
+      const [r] = await pool.query(del, [id_medico, fecha, hora, id_especialidad]);
+      if (!r.affectedRows) return res.status(404).json({ mensaje: "Horario no encontrado" });
       return res.json({ mensaje: "Horario eliminado correctamente" });
     }
     if (accion === "actualizar") {
+      if (!nuevaHora) return res.status(400).json({ mensaje: "nuevaHora requerida" });
       const upd = `UPDATE horarios_medicos SET horario_hora=?, horario_estado=0
                    WHERE id_medico=? AND horario_fecha=? AND horario_hora=? AND id_especialidad=?`;
-      await pool.query(upd, [nuevaHora, id_medico, fecha, hora, id_especialidad]);
+      const [r] = await pool.query(upd, [nuevaHora, id_medico, fecha, hora, id_especialidad]);
+      if (!r.affectedRows) return res.status(404).json({ mensaje: "Horario no encontrado" });
       return res.json({ mensaje: "Horario actualizado correctamente" });
     }
     if (accion === "ocupar" || accion === "liberar") {
       const occ = `UPDATE horarios_medicos SET horario_estado=? 
                    WHERE id_medico=? AND horario_fecha=? AND horario_hora=? AND id_especialidad=?`;
       const estado = accion === "ocupar" ? 1 : 0;
-      // asegurar especialidad real si no vino:
-      let espId = id_especialidad;
-      if (!espId) {
-        const [r] = await pool.query(
-          `SELECT id_especialidad FROM horarios_medicos 
-           WHERE id_medico=? AND horario_fecha=? AND horario_hora=? LIMIT 1`,
-          [id_medico, fecha, hora]
-        );
-        espId = r[0]?.id_especialidad;
-      }
-      await pool.query(occ, [estado, id_medico, fecha, hora, espId]);
+      const [r] = await pool.query(occ, [estado, id_medico, fecha, hora, id_especialidad]);
+      if (!r.affectedRows) return res.status(404).json({ mensaje: "Horario no encontrado" });
       return res.json({ mensaje: estado ? "Horario ocupado" : "Horario liberado" });
     }
     return res.status(400).json({ mensaje: "Acción no reconocida" });
   } catch (e) {
     console.error(`[${rid}] /horario/editar ERROR`, e);
     res.status(500).json({ mensaje: "Error al editar horario" });
+  }
+});
+
+// OPCIONAL: Actualizar por id_horario (si algún día lo usas en la app)
+app.put("/horario/actualizar/:id_horario", async (req, res) => {
+  const rid = req.rid;
+  const { id_horario } = req.params;
+  const { accion, nueva_hora, estado } = req.body || {};
+  try {
+    if (accion === "mover") {
+      if (!nueva_hora) return res.status(400).json({ mensaje: "nueva_hora requerida" });
+      const sql = `UPDATE horarios_medicos SET horario_hora=?, horario_estado=0 WHERE id_horario=?`;
+      const [r] = await pool.query(sql, [nueva_hora, id_horario]);
+      if (!r.affectedRows) return res.status(404).json({ mensaje: "Horario no encontrado" });
+      return res.json({ mensaje: "Horario movido" });
+    }
+    if (accion === "estado") {
+      if (estado !== 0 && estado !== 1) return res.status(400).json({ mensaje: "estado debe ser 0 o 1" });
+      const sql = `UPDATE horarios_medicos SET horario_estado=? WHERE id_horario=?`;
+      const [r] = await pool.query(sql, [estado, id_horario]);
+      if (!r.affectedRows) return res.status(404).json({ mensaje: "Horario no encontrado" });
+      return res.json({ mensaje: "Estado actualizado" });
+    }
+    return res.status(400).json({ mensaje: "Acción no reconocida" });
+  } catch (e) {
+    console.error(`[${rid}] /horario/actualizar ERROR`, e);
+    res.status(500).json({ mensaje: "Error al actualizar horario" });
   }
 });
 
@@ -529,11 +638,35 @@ app.get("/citas/:usuario", async (req, res) => {
        ORDER BY c.id_cita ASC`;
     console.log(`[${rid}] SQL> ${sql} params=["${usuario}"]`);
     const [rows] = await pool.query(sql, [usuario]);
-    console.log(`[${rid}] /citas/${usuario} -> ${rows.length} citas`);
     const citasNumeradas = rows.map((c, i) => ({ ...c, numero_orden: i + 1 }));
     res.json({ listaCitas: citasNumeradas });
   } catch (e) {
     console.error(`[${rid}] /citas/:usuario ERROR`, e);
+    res.status(500).json({ mensaje: "Error interno" });
+  }
+});
+
+// NUEVO: citas por médico
+app.get("/citas/medico/:id_medico", async (req, res) => {
+  const rid = req.rid;
+  const { id_medico } = req.params;
+  try {
+    const sql = `
+      SELECT c.id_cita, c.id_usuario, c.id_medico,
+             DATE_FORMAT(c.cita_fecha,'%d/%m/%Y') AS cita_fecha,
+             TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora,
+             u.usuario_nombre AS paciente_nombre,
+             u.usuario_apellido AS paciente_apellido,
+             c.cita_estado
+        FROM citas c
+        JOIN usuarios u ON c.id_usuario=u.id_usuario
+       WHERE c.id_medico=?
+       ORDER BY c.cita_fecha, c.cita_hora`;
+    console.log(`[${rid}] SQL> ${sql} params=[${id_medico}]`);
+    const [rows] = await pool.query(sql, [id_medico]);
+    res.json({ listaCitas: rows });
+  } catch (e) {
+    console.error(`[${rid}] /citas/medico ERROR`, e);
     res.status(500).json({ mensaje: "Error interno" });
   }
 });
@@ -575,7 +708,7 @@ app.post("/cita/agregar", async (req, res) => {
   try {
     console.log(`[${rid}] /cita/agregar payload`, { id_usuario, id_medico, fecha: cita_fecha, cita_hora });
 
-    // 1) Validar que el slot esté libre (horario_estado=0)
+    // 1) Validar slot libre
     const qSlot = `SELECT id_horario, id_especialidad, horario_estado
                      FROM horarios_medicos
                     WHERE id_medico=? AND horario_fecha=? AND horario_hora=?`;
@@ -584,7 +717,7 @@ app.post("/cita/agregar", async (req, res) => {
       return res.status(409).json({ mensaje: "El horario no está disponible" });
     }
 
-    // 2) numero_orden = citas previas + 1
+    // 2) numero_orden = count + 1
     const [cnt] = await pool.query("SELECT COUNT(*) AS total FROM citas WHERE id_usuario=?", [id_usuario]);
     const numero_orden = (cnt[0]?.total || 0) + 1;
 
@@ -611,7 +744,6 @@ app.put("/cita/actualizar/:id", async (req, res) => {
   const { id } = req.params;
   const { id_usuario, id_medico, cita_fecha, cita_hora, cita_estado = 1 } = req.body || {};
   try {
-    // horario anterior
     const [prev] = await pool.query("SELECT cita_fecha, cita_hora, id_medico FROM citas WHERE id_cita=?", [id]);
     if (!prev.length) return res.status(404).json({ mensaje: "Cita no encontrada" });
 
@@ -675,8 +807,25 @@ app.put("/cita/anular/:id_usuario/:numero_orden", async (req, res) => {
   }
 });
 
+// NUEVO: actualizar solo el estado de la cita (0=Cancelada, 1=Confirmada)
+app.put("/cita/estado/:id_cita", async (req, res) => {
+  const rid = req.rid;
+  const { id_cita } = req.params;
+  const { estado } = req.body || {};
+  if (estado !== 0 && estado !== 1) return res.status(400).json({ mensaje: "estado debe ser 0 o 1" });
+  try {
+    const sql = "UPDATE citas SET cita_estado=? WHERE id_cita=?";
+    const [r] = await pool.query(sql, [estado, id_cita]);
+    if (!r.affectedRows) return res.status(404).json({ mensaje: "Cita no encontrada" });
+    res.json({ mensaje: "Estado de cita actualizado" });
+  } catch (e) {
+    console.error(`[${rid}] /cita/estado ERROR`, e);
+    res.status(500).json({ mensaje: "Error al actualizar estado de cita" });
+  }
+});
+
 /* =========================================
- *  MEDICOS util
+ *  MEDICOS util + especialidad por médico
  * ========================================= */
 app.get("/medicos", async (req, res) => {
   const rid = req.rid;
@@ -685,6 +834,23 @@ app.get("/medicos", async (req, res) => {
     res.json(rows.length ? { listaCitas: rows } : { mensaje: "no hay registros" });
   } catch (e) {
     console.error(`[${rid}] /medicos ERROR`, e);
+    res.status(500).json({ mensaje: "Error interno" });
+  }
+});
+
+app.get("/medico/:id_medico/especialidades", async (req, res) => {
+  const rid = req.rid;
+  const { id_medico } = req.params;
+  try {
+    const sql = `
+      SELECT e.* 
+        FROM medicos m 
+        JOIN especialidades e ON e.id_especialidad=m.id_especialidad
+       WHERE m.id_medico=?`;
+    const [rows] = await pool.query(sql, [id_medico]);
+    res.json({ listaEspecialidades: rows });
+  } catch (e) {
+    console.error(`[${rid}] /medico/:id_medico/especialidades ERROR`, e);
     res.status(500).json({ mensaje: "Error interno" });
   }
 });
