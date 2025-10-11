@@ -160,21 +160,58 @@ app.get("/usuarios", (req, res) => {
   });
 });
 
-/* Login (usa hash; compatible con contraseñas antiguas en texto) */
 app.post("/usuario/login", (req, res) => {
-  const { usuario_correo, password } = req.body || {};
-  if (!usuario_correo || !password)
-    return res.status(400).json({ mensaje: "Faltan datos" });
+  const raw = req.body || {};
+  const usuario_correo = String(raw.usuario_correo || "").trim().toLowerCase();
+  const password =
+    raw.password ??
+    raw.contrasena ??
+    raw.usuario_contrasena ??
+    raw.pass ??
+    "";
 
-  const q = "SELECT * FROM usuarios WHERE usuario_correo = ?";
+  console.log("[LOGIN] body:", {
+    usuario_correo,
+    keys: Object.keys(raw)    // para ver qué llegó desde Android
+  });
+
+  if (!usuario_correo || !password) {
+    console.log("[LOGIN] faltan datos");
+    return res.status(400).json({ mensaje: "Faltan datos" });
+  }
+
+  const q = "SELECT * FROM usuarios WHERE LOWER(usuario_correo) = ?";
   conexion.query(q, [usuario_correo], (err, rows) => {
-    if (err) return res.status(500).json({ mensaje: "Error DB" });
-    if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
-    const u = rows[0];
-    if (!verifyPassword(password, u.usuario_contrasena)) {
-      return res.status(401).json({ mensaje: "Contraseña incorrecta" });
+    if (err) {
+      console.error("[LOGIN] error DB:", err.message);
+      return res.status(500).json({ mensaje: "Error DB" });
     }
-    res.json({
+    if (!rows.length) {
+      console.warn("[LOGIN] correo no registrado:", usuario_correo);
+      return res.status(404).json({ mensaje: "Correo no registrado" });
+    }
+
+    const u = rows[0];
+
+    const stored = u.usuario_contrasena || "";
+    let ok = false;
+    if (stored.includes(":")) {
+      // hash con salt
+      const [salt, hash] = stored.split(":");
+      const test = require("crypto")
+        .createHash("sha256")
+        .update(salt + String(password))
+        .digest("hex");
+      ok = test === hash;
+    } else {
+      ok = String(password) === stored;
+    }
+
+    console.log("[LOGIN] verificación:", ok ? "OK" : "FAIL");
+
+    if (!ok) return res.status(401).json({ mensaje: "Contraseña incorrecta" });
+
+    return res.json({
       id_usuario: u.id_usuario,
       usuario_nombre: u.usuario_nombre,
       usuario_apellido: u.usuario_apellido,
