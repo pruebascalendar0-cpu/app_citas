@@ -108,11 +108,24 @@ function saltHash(plain) {
   return `${salt}:${hash}`;
 }
 
+// --- helpers de password (déjalos cerca de tus otros helpers) ---
 function verifyPassword(plain, stored) {
+  // stored = "<salt>:<sha256(salt + plain)>"
   if (!stored || !stored.includes(":")) return false;
   const [salt, hash] = stored.split(":");
-  const test = crypto.createHash("sha256").update(salt + String(plain)).digest("hex");
-  return test.toLowerCase() === (hash || "").toLowerCase();
+  const test = require("crypto")
+    .createHash("sha256")
+    .update(salt + String(plain))
+    .digest("hex");
+  return test.toLowerCase() === String(hash || "").toLowerCase();
+}
+
+// (opcional: solo si necesitas crear hashes desde Node)
+function makePassword(plain) {
+  const crypto = require("crypto");
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.createHash("sha256").update(salt + String(plain)).digest("hex");
+  return `${salt}:${hash}`;
 }
 
 /* ============ BD ============ */
@@ -142,55 +155,47 @@ app.get("/", (_, res) => res.send("API Clínica Salud Total"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 // ===== LOGIN (compatible con tu BD actual) =====
+// LOGIN robusto (normaliza correo y usa hash <salt>:<sha256>)
 app.post("/usuario/login", (req, res) => {
-  try {
-    const correo = String(req.body?.usuario_correo || "").trim().toLowerCase();
-    // por si en algún cliente llega con otra key
-    const password = String(req.body?.password ?? req.body?.contrasena ?? req.body?.pass ?? "");
+  const correo = String(req.body?.usuario_correo || req.body?.email || "")
+    .trim()
+    .toLowerCase();
+  const pass = String(req.body?.password || "");
 
-    console.log("[LOGIN] body:", { usuario_correo: correo, keys: Object.keys(req.body || {}) });
-
-    if (!correo || !password) {
-      return res.status(400).json({ mensaje: "Correo y password requeridos" });
-    }
-
-    const sql = `
-      SELECT id_usuario, usuario_nombre, usuario_apellido,
-             usuario_correo, usuario_tipo, usuario_contrasena_hash
-      FROM usuarios
-      WHERE LOWER(usuario_correo)=?
-      LIMIT 1
-    `;
-
-    db.query(sql, [correo], (err, rows) => {
-      if (err) {
-        console.error("[LOGIN] DB error:", err.code, err.message);
-        return res.status(500).json({ mensaje: "Error en base de datos" });
-      }
-      if (!rows.length) {
-        return res.status(404).json({ mensaje: "Correo no registrado" });
-      }
-
-      const u = rows[0];
-      const stored = u.usuario_contrasena_hash || "";
-      const ok = verifyPassword(password, stored);
-
-      console.log("[LOGIN] verificación:", ok ? "OK" : "FAIL");
-      if (!ok) return res.status(401).json({ mensaje: "Contraseña incorrecta" });
-
-      // Respuesta tipo UsuarioDto (lo que espera tu app)
-      return res.json({
-        id_usuario: u.id_usuario,
-        usuario_nombre: u.usuario_nombre,
-        usuario_apellido: u.usuario_apellido,
-        usuario_correo: u.usuario_correo,
-        usuario_tipo: u.usuario_tipo,
-      });
-    });
-  } catch (e) {
-    console.error("[LOGIN] exception:", e);
-    return res.status(500).json({ mensaje: "Error inesperado" });
+  if (!correo || !pass) {
+    return res.status(400).json({ mensaje: "Correo y password requeridos" });
   }
+
+  const sql = `
+    SELECT
+      id_usuario,
+      usuario_nombre,
+      usuario_apellido,
+      usuario_correo,
+      usuario_tipo,
+      usuario_contrasena_hash
+    FROM usuarios
+    WHERE LOWER(usuario_correo) = ?
+    LIMIT 1
+  `;
+
+  conexion.query(sql, [correo], (e, rows) => {
+    if (e) return res.status(500).json({ mensaje: "Error en la base de datos" });
+    if (!rows.length) return res.status(404).json({ mensaje: "Correo no registrado" });
+
+    const u = rows[0];
+    const ok = verifyPassword(pass, u.usuario_contrasena_hash);
+    if (!ok) return res.status(401).json({ mensaje: "Contraseña incorrecta" });
+
+    // Login OK
+    res.json({
+      id_usuario: u.id_usuario,
+      usuario_nombre: u.usuario_nombre,
+      usuario_apellido: u.usuario_apellido,
+      usuario_correo: u.usuario_correo,
+      usuario_tipo: u.usuario_tipo,
+    });
+  });
 });
 
 // Registrar paciente
