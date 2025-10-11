@@ -10,6 +10,22 @@ const app = express();
 const PUERTO = process.env.PORT || 3000;
 app.use(express.json());
 
+/* ============ Middleware de request-id y logging básico ============ */
+app.use((req, res, next) => {
+  req.rid = crypto.randomUUID().slice(0, 8);
+  const started = Date.now();
+  console.log(`[${req.rid}] -> ${req.method} ${req.originalUrl}`);
+  if (["POST", "PUT"].includes(req.method)) {
+    try {
+      console.log(`[${req.rid}] body:`, req.body);
+    } catch {}
+  }
+  res.on("finish", () => {
+    console.log(`[${req.rid}] <- ${res.statusCode} ${req.method} ${req.originalUrl} (${Date.now() - started}ms)`);
+  });
+  next();
+});
+
 /* =================== Email (Nodemailer / SMTP) =================== */
 /**
  * Requisitos para Gmail:
@@ -77,9 +93,15 @@ async function enviarMail({ to, subject, html, text, category = "notificaciones"
     headers,
   };
 
-  const info = await transporter.sendMail(msg);
-  console.log("✉️  Email enviado:", { messageId: info.messageId, to });
-  return info;
+  try {
+    console.log(`[@mail] intent: to=${to} subject="${subject}" category=${category}`);
+    const info = await transporter.sendMail(msg);
+    console.log(`[@mail] ok: messageId=${info.messageId}`);
+    return info;
+  } catch (e) {
+    console.error(`[@mail] error:`, e?.response || e);
+    throw e;
+  }
 }
 const wrap = (inner) => `
   <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;line-height:1.5;color:#222;max-width:560px">
@@ -125,6 +147,23 @@ conexion.connect((err) => {
   console.log("✅ Conexión MySQL OK");
   // Fija TZ de la sesión para evitar corrimientos con UTC
   conexion.query("SET time_zone = '-05:00'", () => {});
+
+  // Asegura tabla de códigos de reset
+  conexion.query(`
+    CREATE TABLE IF NOT EXISTS reset_codes (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      email VARCHAR(150) NOT NULL,
+      code_hash CHAR(64) NOT NULL,
+      expires_at DATETIME NOT NULL,
+      used TINYINT(1) NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX (email),
+      INDEX (expires_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `, (e) => {
+    if (e) console.error("⚠️  No se pudo crear/verificar tabla reset_codes:", e.message);
+    else console.log("✅ Tabla reset_codes lista");
+  });
 });
 
 app.get("/", (_, res) => res.send("API Clínica Salud Total"));
@@ -232,6 +271,138 @@ app.post("/usuario/agregar", (req, res) => {
   });
 });
 
+/* =================== RESET DE CONTRASEÑA (para Android) =================== */
+function genCode6() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+function sha256(s) {
+  return crypto.createHash("sha256").update(s).digest("hex");
+}
+
+// Solicitar código por correo
+app.post("/usuario/reset/solicitar", (req, res) => {
+  const { email } = req.body || {};
+  const correo = String(email || "").trim().toLowerCase();
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
+    return res.status(400).json({ ok: false, mensaje: "Correo inválido" });
+  }
+
+  console.log(`[${req.rid}] reset/solicitar -> ${correo}`);
+
+  const qUser = "SELECT id_usuario, usuario_nombre, usuario_apellido FROM usuarios WHERE LOWER(usuario_correo)=?";
+  conexion.query(qUser, [correo], async (e1, r1) => {
+    if (e1) {
+      console.error(`[${req.rid}] reset/solicitar error DB:`, e1.message);
+      return res.status(500).json({ ok: false, mensaje: "Error en base de datos" });
+    }
+    if (!r1.length) {
+      // Evitar filtrar existencia (respuesta genérica)
+      console.log(`[${req.rid}] reset/solicitar: correo no registrado (respuesta genérica ok)`);
+      return res.json({ ok: true, mensaje: "Si el correo existe, se envió un código." });
+    }
+
+    const code = genCode6();
+    const codeHash = sha256(code);
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 min
+    const qIns = "INSERT INTO reset_codes (email, code_hash, expires_at) VALUES (?, ?, ?)";
+
+    conexion.query(qIns, [correo, codeHash, expiresAt], async (e2) => {
+      if (e2) {
+        console.error(`[${req.rid}] reset/solicitar insert error:`, e2.message);
+        return res.status(500).json({ ok: false, mensaje: "No se pudo generar el código" });
+      }
+
+      try {
+        await enviarMail({
+          to: correo,
+          subject: "Código de verificación - Restablecer contraseña",
+          html: wrap(`
+            <h2 style="margin:0 0 8px 0;">Restablecer contraseña</h2>
+            <p>Usa este código para cambiar tu contraseña. <strong>Vence en 15 minutos</strong>.</p>
+            <p style="font-size:22px;letter-spacing:3px;"><strong>${code}</strong></p>
+            <p>Si no solicitaste este código, ignora este correo.</p>
+          `),
+          category: "reset-password",
+        });
+        console.log(`[${req.rid}] reset/solicitar -> código enviado a ${correo}`);
+        return res.json({ ok: true, mensaje: "Código enviado" });
+      } catch (e) {
+        console.error(`[${req.rid}] reset/solicitar mail error:`, e?.response || e);
+        return res.status(500).json({ ok: false, mensaje: "No se pudo enviar el código" });
+      }
+    });
+  });
+});
+
+// Cambiar contraseña con código
+app.post("/usuario/reset/cambiar", (req, res) => {
+  const { email, code, new_password } = req.body || {};
+  const correo = String(email || "").trim().toLowerCase();
+  const pin = String(code || "").trim();
+  const nueva = String(new_password || "");
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correo)) {
+    return res.status(400).json({ ok: false, mensaje: "Correo inválido" });
+  }
+  if (!/^\d{6}$/.test(pin)) {
+    return res.status(400).json({ ok: false, mensaje: "Código inválido" });
+  }
+  if (nueva.length < 6) {
+    return res.status(400).json({ ok: false, mensaje: "La nueva contraseña debe tener mínimo 6 caracteres." });
+  }
+
+  console.log(`[${req.rid}] reset/cambiar -> ${correo}`);
+
+  const codeHash = sha256(pin);
+  const qSel = `
+    SELECT id, expires_at, used
+      FROM reset_codes
+     WHERE email=? AND code_hash=?
+     ORDER BY id DESC
+     LIMIT 1
+  `;
+  conexion.query(qSel, [correo, codeHash], (e1, r1) => {
+    if (e1) {
+      console.error(`[${req.rid}] reset/cambiar error DB:`, e1.message);
+      return res.status(500).json({ ok: false, mensaje: "Error en base de datos" });
+    }
+    if (!r1.length) {
+      return res.status(400).json({ ok: false, mensaje: "Código inválido" });
+    }
+    const row = r1[0];
+    if (row.used) {
+      return res.status(400).json({ ok: false, mensaje: "Código ya utilizado" });
+    }
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ ok: false, mensaje: "Código vencido" });
+    }
+
+    const newHash = (function hashPassword(plain) {
+      const salt = crypto.randomBytes(16).toString("hex");
+      const hash = crypto.createHash("sha256").update(salt + plain).digest("hex");
+      return `${salt}:${hash}`;
+    })(nueva);
+
+    const qUpdPass = "UPDATE usuarios SET usuario_contrasena_hash=? WHERE LOWER(usuario_correo)=?";
+    conexion.query(qUpdPass, [newHash, correo], (e2, r2) => {
+      if (e2) {
+        console.error(`[${req.rid}] reset/cambiar update pass error:`, e2.message);
+        return res.status(500).json({ ok: false, mensaje: "No se pudo actualizar la contraseña" });
+      }
+      if (r2.affectedRows === 0) {
+        return res.status(400).json({ ok: false, mensaje: "No se encontró el usuario" });
+      }
+
+      conexion.query("UPDATE reset_codes SET used=1 WHERE id=?", [row.id], (e3) => {
+        if (e3) console.error(`[${req.rid}] reset/cambiar marcar usado error:`, e3.message);
+        console.log(`[${req.rid}] reset/cambiar -> contraseña actualizada para ${correo}`);
+        return res.json({ ok: true, mensaje: "Contraseña actualizada" });
+      });
+    });
+  });
+});
+
 /* =================== ESPECIALIDADES / MÉDICOS / HORARIOS =================== */
 app.get("/especialidades", (_, res) => {
   conexion.query("SELECT * FROM especialidades", (e, r) => {
@@ -302,10 +473,13 @@ app.post("/cita/agregar", (req, res) => {
   let { id_usuario, id_medico, cita_fecha, cita_hora } = req.body || {};
   cita_fecha = toYYYYMMDD(cita_fecha);
 
+  console.log(`[${req.rid}] /cita/agregar payload saneado:`, { id_usuario, id_medico, cita_fecha, cita_hora });
+
   const qOrden = "SELECT COUNT(*) AS total FROM citas WHERE id_usuario = ?";
   conexion.query(qOrden, [id_usuario], (e1, r1) => {
     if (e1) return res.status(500).json({ error: "Error al calcular número de orden" });
     const numero_orden = (r1[0]?.total || 0) + 1;
+    console.log(`[${req.rid}] /cita/agregar numero_orden calculado:`, numero_orden);
 
     const qIns = `
       INSERT INTO citas (id_usuario,id_medico,cita_fecha,cita_hora,numero_orden)
@@ -320,6 +494,7 @@ app.post("/cita/agregar", (req, res) => {
 
       conexion.query("SELECT usuario_correo FROM usuarios WHERE id_usuario=?", [id_usuario], (e3, r3) => {
         if (e3 || !r3.length) return res.status(404).json({ error: "Usuario no encontrado" });
+        console.log(`[${req.rid}] /cita/agregar correo a:`, r3[0].usuario_correo);
         correoConfirmacion(r3[0].usuario_correo, cita_fecha, cita_hora).catch(() => {});
         res.json({ mensaje: "Cita registrada correctamente", numero_orden });
       });
@@ -395,6 +570,8 @@ app.put("/cita/anular/:id_cita", (req, res) => {
 // Citas por usuario (fechas ya formateadas para UI)
 app.get("/citas/:usuario", (req, res) => {
   const { usuario } = req.params;
+  console.log(`[${req.rid}] /citas/${usuario} -> consultando`);
+
   const consulta = `
     SELECT c.id_cita, c.id_usuario, c.id_medico,
            DATE_FORMAT(c.cita_fecha, '%d/%m/%Y') AS cita_fecha,
@@ -410,6 +587,7 @@ app.get("/citas/:usuario", (req, res) => {
   conexion.query(consulta, [usuario], (error, rpta) => {
     if (error) return res.status(500).json({ error: error.message });
     const lista = rpta.map((cita, idx) => ({ ...cita, numero_orden: idx + 1 }));
+    console.log(`[${req.rid}] /citas/${usuario} -> ${lista.length} cita(s)`);
     res.json({ listaCitas: lista });
   });
 });
