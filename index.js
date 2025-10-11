@@ -81,6 +81,12 @@ function generarCodigo(len = 6) {
   return Array.from(crypto.randomFillSync(new Uint8Array(len))).map(b => chars[b % chars.length]).join("");
 }
 
+function toYYYYMMDD(val) {
+  if (!val) return val;
+  if (typeof val === "string" && val.includes("T")) return val.slice(0, 10); // "2025-10-11"
+  return String(val).slice(0, 10);
+}
+
 // --- BD ---
 const conexion = mysql.createConnection({
   host: process.env.DB_HOST,
@@ -453,6 +459,7 @@ app.get("/horarios/:parametro", (req, res) => {
 
 app.post("/horario/registrar", (req, res) => {
   const { id_medico, horario_horas, horario_fecha, id_especialidad } = req.body;
+  horario_fecha = toYYYYMMDD(horario_fecha);
   if (!id_medico || !horario_horas || !horario_fecha || !id_especialidad) return res.status(400).json({ error: "Faltan datos obligatorios" });
   const horario_estado = 0;
   const consulta = `
@@ -532,6 +539,7 @@ app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", (req, res) =
 
 app.post("/cita/agregar", (req, res) => {
   const { id_usuario, id_medico, cita_fecha, cita_hora } = req.body;
+  cita_fecha = toYYYYMMDD(cita_fecha);
 
   const qOrden = "SELECT COUNT(*) AS total FROM citas WHERE id_usuario = ?";
   conexion.query(qOrden, [id_usuario], (error, results) => {
