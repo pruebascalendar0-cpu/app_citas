@@ -55,6 +55,24 @@ oauth2Client.setCredentials({ refresh_token: GMAIL_REFRESH_TOKEN });
 
 const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 
+function encodeHeader(str) {
+  return `=?UTF-8?B?${Buffer.from(str, "utf8").toString("base64")}?=`;
+}
+
+async function gmailSend({ to, subject, html, fromEmail = EMAIL_USER, fromName = EMAIL_FROM, replyTo = REPLY_TO }) {
+  const subjectEncoded = encodeHeader(subject);
+  const fromEncoded = fromName ? `${encodeHeader(fromName)} <${fromEmail}>` : `<${fromEmail}>`;
+
+  const headers = [
+    `From: ${fromEncoded}`,
+    `To: ${to}`,
+    `Subject: ${subjectEncoded}`,
+    `MIME-Version: 1.0`,
+    `Content-Type: text/html; charset="UTF-8"`,
+  ];
+  // ...
+}
+
 // Chequeo rápido de perfil para log
 gmail.users.getProfile({ userId: "me" })
   .then(r => console.log(`📧 Gmail API OK. Enviando como: ${r.data.emailAddress || EMAIL_USER}`))
@@ -501,6 +519,63 @@ app.put("/horario/editar/:id_medico/:fecha/:hora", (req, res) => {
   }
 });
 
+// === ESPECIALIDADES DEL MÉDICO ===
+app.get("/medico/:id/especialidades", (req, res) => {
+  const { id } = req.params;
+  const sql = `
+    SELECT e.id_especialidad, e.especialidad_nombre
+    FROM medicos m
+    INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
+    WHERE m.id_medico = ?
+  `;
+  conexion.query(sql, [id], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error al obtener especialidades del médico" });
+    return res.json({ listaEspecialidades: rows || [] });
+  });
+});
+
+// === HORARIOS REGISTRADOS DEL MÉDICO POR FECHA Y ESPECIALIDAD ===
+app.get("/horarios/registrados/:id_medico/:fecha/:id_especialidad", (req, res) => {
+  const { id_medico, fecha, id_especialidad } = req.params;
+  const fechaOK = normalizeDate(fecha);
+
+  const sql = `
+    SELECT TIME_FORMAT(horario_hora,'%H:%i') AS hora
+    FROM horarios_medicos
+    WHERE id_medico = ? AND horario_fecha = ? AND id_especialidad = ?
+    ORDER BY horario_hora ASC
+  `;
+  conexion.query(sql, [id_medico, fechaOK, id_especialidad], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error al listar horarios registrados" });
+    res.json({ horarios: (rows || []).map(r => r.hora) });
+  });
+});
+
+// === CITAS DE UN MÉDICO ===
+app.get("/citas/medico/:id_medico", (req, res) => {
+  const { id_medico } = req.params;
+  const sql = `
+    SELECT c.id_cita, c.id_usuario, c.id_medico,
+           DATE_FORMAT(c.cita_fecha, '%Y-%m-%d') AS cita_fecha_sql,
+           DATE_FORMAT(c.cita_fecha, '%d/%m/%Y') AS cita_fecha_mostrar,
+           TIME_FORMAT(c.cita_hora, '%H:%i') AS cita_hora,
+           u.usuario_nombre AS paciente_nombre,
+           u.usuario_apellido AS paciente_apellido,
+           e.especialidad_nombre,
+           c.cita_estado
+    FROM citas c
+    INNER JOIN usuarios u ON c.id_usuario = u.id_usuario
+    INNER JOIN medicos m ON c.id_medico = m.id_medico
+    INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
+    WHERE c.id_medico = ?
+    ORDER BY c.cita_fecha, c.cita_hora
+  `;
+  conexion.query(sql, [id_medico], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error al obtener citas del médico" });
+    res.json({ listaCitas: rows || [] });
+  });
+});
+
 /* Citas */
 app.post("/cita/agregar", (req, res) => {
   console.log("[/cita/agregar] Body:", req.body);
@@ -595,20 +670,21 @@ app.get("/citas/:usuario", (req, res) => {
   console.log("[/citas/:usuario] Params:", req.params);
   const { usuario } = req.params;
   const consulta = `
-    SELECT c.id_cita, c.id_usuario, c.id_medico,
-           DATE_FORMAT(c.cita_fecha, '%d/%m/%Y') AS cita_fecha,
-           TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora,
-           u.usuario_nombre AS medico_nombre,
-           u.usuario_apellido AS medico_apellido,
-           e.id_especialidad, e.especialidad_nombre,
-           c.cita_estado
-    FROM citas c
-    INNER JOIN medicos m ON c.id_medico = m.id_medico
-    INNER JOIN usuarios u ON m.id_medico = u.id_usuario
-    INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
-    WHERE c.id_usuario = ?
-    ORDER BY c.id_cita ASC
-  `;
+  SELECT c.id_cita, c.id_usuario, c.id_medico,
+         DATE_FORMAT(c.cita_fecha, '%Y-%m-%d') AS cita_fecha_sql,
+         DATE_FORMAT(c.cita_fecha, '%d/%m/%Y') AS cita_fecha_mostrar,
+         TIME_FORMAT(c.cita_hora,'%H:%i') AS cita_hora,
+         u.usuario_nombre AS medico_nombre,
+         u.usuario_apellido AS medico_apellido,
+         e.id_especialidad, e.especialidad_nombre,
+         c.cita_estado
+  FROM citas c
+  INNER JOIN medicos m ON c.id_medico = m.id_medico
+  INNER JOIN usuarios u ON m.id_medico = u.id_usuario
+  INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
+  WHERE c.id_usuario = ?
+  ORDER BY c.id_cita ASC
+`;
   conexion.query(consulta, [usuario], (error, rpta) => {
     if (error) return res.status(500).json({ error: error.message });
     const obj = {};
@@ -688,36 +764,80 @@ app.put("/cita/anular/:id_usuario/:numero_orden", (req, res) => {
 
 // Cancelar por id_cita (recomendado)
 app.put("/cita/anular/:id_cita", (req, res) => {
-  console.log("[/cita/anular/:id_cita] Params:", req.params);
   const { id_cita } = req.params;
 
-  const consultaDatosCita = "SELECT cita_fecha, cita_hora, id_medico, id_usuario FROM citas WHERE id_cita = ?";
-  conexion.query(consultaDatosCita, [id_cita], (error, resultados) => {
-    if (error) return res.status(500).json({ error: "Error al obtener los datos de la cita" });
-    if (resultados.length === 0) return res.status(404).json({ mensaje: "Cita no encontrada" });
+  const sel = `
+    SELECT cita_estado,
+           DATE_FORMAT(cita_fecha,'%Y-%m-%d') AS fecha_sql,
+           TIME_FORMAT(cita_hora,'%H:%i')    AS hora_sql,
+           id_medico, id_usuario
+    FROM citas WHERE id_cita = ?
+  `;
+  conexion.query(sel, [id_cita], (e0, rows) => {
+    if (e0) return res.status(500).json({ error: "Error al obtener la cita" });
+    if (!rows || rows.length === 0) return res.status(404).json({ mensaje: "Cita no encontrada" });
 
-    const { cita_fecha, cita_hora, id_medico, id_usuario } = resultados[0];
-    conexion.query("UPDATE citas SET cita_estado = 0 WHERE id_cita = ?", [id_cita], (error2) => {
-      if (error2) return res.status(500).json({ error: "Error al cancelar la cita" });
+    const { cita_estado, fecha_sql, hora_sql, id_medico, id_usuario } = rows[0];
 
-      const consultaLiberarHorario = `
-        UPDATE horarios_medicos 
-        SET horario_estado = 0 
+    // idempotencia
+    if (cita_estado === 0) {
+      return res.status(409).json({ mensaje: "La cita ya estaba cancelada" });
+    }
+
+    conexion.query("UPDATE citas SET cita_estado = 0 WHERE id_cita = ?", [id_cita], (e1) => {
+      if (e1) return res.status(500).json({ error: "Error al cancelar la cita" });
+
+      const free = `
+        UPDATE horarios_medicos
+        SET horario_estado = 0
         WHERE horario_fecha = ? AND horario_hora = ? AND id_medico = ?
       `;
-      conexion.query(consultaLiberarHorario, [cita_fecha, cita_hora, id_medico], (error3) => {
-        if (error3) return res.status(500).json({ error: "Error al liberar el horario" });
+      conexion.query(free, [fecha_sql, hora_sql, id_medico], (e2) => {
+        if (e2) return res.status(500).json({ error: "Error al liberar el horario" });
 
-        const consultaCorreo = "SELECT usuario_correo FROM usuarios WHERE id_usuario = ?";
-        conexion.query(consultaCorreo, [id_usuario], (err4, rpta) => {
-          if (!err4 && rpta.length > 0) {
-            const destinatario = rpta[0].usuario_correo;
-            enviarCorreoCancelacion(destinatario, cita_fecha, cita_hora).catch(()=>{});
+        // enviar correo solo cuando realmente canceló
+        const qMail = "SELECT usuario_correo FROM usuarios WHERE id_usuario = ?";
+        conexion.query(qMail, [id_usuario], (e3, r3) => {
+          if (!e3 && r3 && r3.length > 0) {
+            enviarCorreoCancelacion(r3[0].usuario_correo, fecha_sql, hora_sql).catch(()=>{});
           }
           res.json({ mensaje: "Cita cancelada y horario liberado correctamente" });
         });
       });
     });
+  });
+});
+
+// === BUSCAR CITA POR NÚMERO DE ORDEN (visual) ===
+app.get("/cita/usuario/:id_usuario/orden/:n", (req, res) => {
+  const { id_usuario, n } = req.params;
+  const sql = `
+    SELECT t.*
+    FROM (
+      SELECT 
+        c.id_cita AS IdCita,
+        CONCAT(u.usuario_nombre,' ',u.usuario_apellido) AS UsuarioCita,
+        e.especialidad_nombre AS Especialidad,
+        CONCAT(mu.usuario_nombre,' ',mu.usuario_apellido) AS Medico,
+        DATE_FORMAT(c.cita_fecha, '%Y-%m-%d') AS FechaCita,
+        TIME_FORMAT(c.cita_hora, '%H:%i') AS HoraCita,
+        CASE WHEN c.cita_estado=1 THEN 'Confirmada' ELSE 'Cancelada' END AS EstadoCita,
+        ROW_NUMBER() OVER (ORDER BY c.id_cita ASC) AS rn
+      FROM citas c
+      INNER JOIN usuarios u  ON c.id_usuario = u.id_usuario
+      INNER JOIN medicos m   ON c.id_medico  = m.id_medico
+      INNER JOIN usuarios mu ON m.id_medico  = mu.id_usuario
+      INNER JOIN especialidades e ON m.id_especialidad = e.id_especialidad
+      WHERE c.id_usuario = ?
+      ORDER BY c.id_cita ASC
+    ) t
+    WHERE t.rn = ?
+    LIMIT 1
+  `;
+  conexion.query(sql, [id_usuario, Number(n)], (err, rows) => {
+    if (err) return res.status(500).json({ error: "Error al buscar la cita" });
+    if (!rows || rows.length === 0) return res.status(404).json({ mensaje: "Cita no encontrada" });
+    res.json(rows[0]);
   });
 });
 
