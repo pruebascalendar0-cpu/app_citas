@@ -226,29 +226,90 @@ app.post("/usuario/agregar", (req, res) => {
 
 app.put("/usuario/actualizar/:id", (req, res) => {
   const { id } = req.params;
-  const { usuario_nombre, usuario_apellido, usuario_correo } = req.body;
-  if (!usuario_nombre || !usuario_apellido || !usuario_correo) {
-    return res.status(400).json({ mensaje: "Todos los campos son obligatorios" });
-  }
-  const verificarCorreo = "SELECT * FROM usuarios WHERE usuario_correo = ? AND id_usuario != ?";
-  conexion.query(verificarCorreo, [usuario_correo, id], (err, results) => {
-    if (err) return res.status(500).json({ mensaje: "Error al verificar correo" });
-    if (results.length > 0) {
-      return res.status(409).json({ mensaje: "El correo ya está en uso por otro usuario" });
+
+  const {
+    usuario_nombre,
+    usuario_apellido,
+    usuario_correo,
+    usuario_dni,
+    usuario_contrasena,
+    usuario_tipo
+  } = req.body || {};
+
+  // Construir SET dinámico solo con los campos enviados
+  const setParts = [];
+  const params = [];
+
+  if (usuario_nombre !== undefined) { setParts.push("usuario_nombre = ?"); params.push(usuario_nombre); }
+  if (usuario_apellido !== undefined) { setParts.push("usuario_apellido = ?"); params.push(usuario_apellido); }
+  if (usuario_correo !== undefined) {
+    // formato de correo
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(usuario_correo)) {
+      return res.status(400).json({ mensaje: "Correo electrónico no válido." });
     }
-    const actualizarUsuario = `
-      UPDATE usuarios SET 
-      usuario_nombre = ?, 
-      usuario_apellido = ?, 
-      usuario_correo = ?
-      WHERE id_usuario = ?
-    `;
-    conexion.query(actualizarUsuario, [usuario_nombre, usuario_apellido, usuario_correo, id], (error) => {
-      if (error) return res.status(500).json({ mensaje: "Error al actualizar usuario" });
-      res.status(200).json({ mensaje: "Usuario actualizado correctamente" });
+    setParts.push("usuario_correo = ?");
+    params.push(usuario_correo);
+  }
+  if (usuario_dni !== undefined) {
+    if (!/^\d{8}$/.test(String(usuario_dni))) {
+      return res.status(400).json({ mensaje: "El DNI debe tener exactamente 8 dígitos numéricos." });
+    }
+    setParts.push("usuario_dni = ?");
+    params.push(usuario_dni);
+  }
+  if (usuario_contrasena !== undefined) {
+    if (String(usuario_contrasena).length < 6) {
+      return res.status(400).json({ mensaje: "La contraseña debe tener al menos 6 caracteres." });
+    }
+    setParts.push("usuario_contrasena = ?");
+    params.push(usuario_contrasena);
+  }
+  if (usuario_tipo !== undefined) { setParts.push("usuario_tipo = ?"); params.push(usuario_tipo); }
+
+  if (setParts.length === 0) {
+    return res.status(400).json({ mensaje: "No se envió ningún campo para actualizar." });
+  }
+
+  // Verificaciones de duplicados solo si se envían esos campos
+  const checks = [];
+
+  if (usuario_correo !== undefined) {
+    checks.push(new Promise((resolve, reject) => {
+      const sql = "SELECT 1 FROM usuarios WHERE usuario_correo = ? AND id_usuario != ? LIMIT 1";
+      conexion.query(sql, [usuario_correo, id], (e, r) => {
+        if (e) return reject(e);
+        if (r.length) return reject({ code: 409, msg: "El correo ya está en uso por otro usuario" });
+        resolve();
+      });
+    }));
+  }
+
+  if (usuario_dni !== undefined) {
+    checks.push(new Promise((resolve, reject) => {
+      const sql = "SELECT 1 FROM usuarios WHERE usuario_dni = ? AND id_usuario != ? LIMIT 1";
+      conexion.query(sql, [usuario_dni, id], (e, r) => {
+        if (e) return reject(e);
+        if (r.length) return reject({ code: 409, msg: "El DNI ya está en uso por otro usuario" });
+        resolve();
+      });
+    }));
+  }
+
+  Promise.all(checks)
+    .then(() => {
+      const sqlUpdate = `UPDATE usuarios SET ${setParts.join(", ")} WHERE id_usuario = ?`;
+      conexion.query(sqlUpdate, [...params, id], (err) => {
+        if (err) return res.status(500).json({ mensaje: "Error al actualizar usuario" });
+        res.status(200).json({ mensaje: "Usuario actualizado correctamente" });
+      });
+    })
+    .catch((err) => {
+      if (err && err.code === 409) return res.status(409).json({ mensaje: err.msg });
+      console.error(err);
+      return res.status(500).json({ mensaje: "Error al verificar duplicados" });
     });
-  });
 });
+
 
 app.post("/usuario/recuperar-correo", (req, res) => {
   const { usuario_dni, usuario_nombre, usuario_apellido } = req.body;
