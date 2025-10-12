@@ -326,6 +326,69 @@ app.post("/usuario/recuperar-contrasena", (req, res) => {
   });
 });
 
+
+// Cambiar contraseña (simple): valida que el correo exista y actualiza la contraseña.
+// Nota: hoy NO validamos 'codigo'. Lo aceptamos para dejar el contrato listo.
+// Cuando implementes códigos, aquí deberías verificarlo antes del UPDATE.
+app.put("/usuario/cambiar-contrasena", (req, res) => {
+  const { usuario_correo, codigo, nueva_contrasena } = req.body;
+  console.log("[/usuario/cambiar-contrasena] Body:", req.body);
+
+  if (!usuario_correo || !nueva_contrasena) {
+    console.warn("[/usuario/cambiar-contrasena] Datos incompletos");
+    return res.status(400).json({ mensaje: "usuario_correo y nueva_contrasena son requeridos" });
+  }
+  if (String(nueva_contrasena).length < 6) {
+    console.warn("[/usuario/cambiar-contrasena] Contraseña corta");
+    return res.status(400).json({ mensaje: "La contraseña debe tener al menos 6 caracteres" });
+  }
+
+  const sqlExiste = "SELECT id_usuario, usuario_nombre, usuario_apellido FROM usuarios WHERE usuario_correo = ?";
+  conexion.query(sqlExiste, [usuario_correo], (err, rpta) => {
+    if (err) {
+      console.error("[/usuario/cambiar-contrasena] Error SELECT:", err.message);
+      return res.status(500).json({ mensaje: "Error interno al validar usuario" });
+    }
+    if (rpta.length === 0) {
+      console.warn("[/usuario/cambiar-contrasena] Correo no encontrado:", usuario_correo);
+      return res.status(404).json({ mensaje: "Correo no registrado" });
+    }
+
+    const sqlUpdate = "UPDATE usuarios SET usuario_contrasena = ? WHERE usuario_correo = ?";
+    conexion.query(sqlUpdate, [nueva_contrasena, usuario_correo], async (err2) => {
+      if (err2) {
+        console.error("[/usuario/cambiar-contrasena] Error UPDATE:", err2.message);
+        return res.status(500).json({ mensaje: "Error al actualizar contraseña" });
+      }
+
+      // Enviar correo de confirmación (opcional)
+      try {
+        const nombreCompleto = `${rpta[0].usuario_nombre} ${rpta[0].usuario_apellido}`;
+        await gmailSend({
+          to: usuario_correo,
+          subject: "Tu contraseña ha sido actualizada",
+          html: `
+            <h2 style="color:#2e86de;">Contraseña actualizada</h2>
+            <p>Hola <strong>${nombreCompleto}</strong>, tu contraseña fue actualizada correctamente.</p>
+            <p>Si no realizaste este cambio, por favor contáctanos de inmediato.</p>
+            <hr/>
+            <footer style="font-size:0.9em;color:#888;">
+              <p><strong>Clínica Salud Total</strong> – Seguridad de cuenta</p>
+            </footer>
+          `
+        });
+        console.log("[/usuario/cambiar-contrasena] ✉️  Correo de confirmación enviado a:", usuario_correo);
+      } catch (e) {
+        console.warn("[/usuario/cambiar-contrasena] No se pudo enviar correo de confirmación:", e?.message);
+      }
+
+      console.log("[/usuario/cambiar-contrasena] ✅ Contraseña actualizada para:", usuario_correo);
+      res.json({ mensaje: "Contraseña actualizada correctamente" });
+    });
+  });
+});
+
+
 app.post("/usuario/registrar", (req, res) => {
   console.log("[/usuario/registrar] Body:", req.body);
   const { usuario_nombre, usuario_apellido, usuario_correo, usuario_dni, usuario_contrasena, usuario_tipo, id_especialidad } = req.body;
